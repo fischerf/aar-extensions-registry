@@ -1,0 +1,89 @@
+{
+  "": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Aar Extensions Registry",
+  "type": "object",
+  "required": [
+    "version",
+    "extensions"
+  ],
+  "properties": {
+    "": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "updated": {
+      "type": "string",
+      "format": "date"
+    },
+    "extensions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "pypi",
+          "description",
+          "tags",
+          "author"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "pypi": {
+            "type": "string",
+            "pattern": "^aar-ext-"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "tool",
+                "safety",
+                "git",
+                "ui",
+                "provider",
+                "workflow",
+                "game",
+                "observability"
+              ]
+            },
+            "minItems": 1
+          },
+          "author": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string",
+            "format": "uri"
+          },
+          "homepage": {
+            "type": "string",
+            "format": "uri"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "published",
+              "planned",
+              "builtin",
+              "deprecated"
+            ],
+            "default": "published"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

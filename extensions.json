@@ -1,0 +1,76 @@
+{
+  "": "./schema/extensions.schema.json",
+  "version": "1.0.0",
+  "updated": "2025-07-17",
+  "extensions": [
+    {
+      "name": "permission-gate",
+      "pypi": "aar-ext-permission-gate",
+      "description": "Confirm before dangerous bash commands (rm -rf, sudo, etc.)",
+      "tags": [
+        "safety"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "protected-paths",
+      "pypi": "aar-ext-protected-paths",
+      "description": "Block writes to .env, secrets files, and sensitive paths",
+      "tags": [
+        "safety"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "git-checkpoint",
+      "pypi": "aar-ext-git-checkpoint",
+      "description": "Auto-commit or stash at turn boundaries for safe rollback",
+      "tags": [
+        "git",
+        "workflow"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "mcp-tools",
+      "pypi": "aar-ext-mcp-tools",
+      "description": "Expose MCP server tools as native Aar tools",
+      "tags": [
+        "tool"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "observability",
+      "pypi": "aar-ext-observability",
+      "description": "Prometheus/OTEL metrics for each agent turn",
+      "tags": [
+        "observability",
+        "workflow"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "companion",
+      "pypi": "aar-ext-companion",
+      "description": "Living digital AI companion with mood, level, and XP tracking",
+      "tags": [
+        "ui",
+        "game"
+      ],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "builtin"
+    }
+  ]
+}

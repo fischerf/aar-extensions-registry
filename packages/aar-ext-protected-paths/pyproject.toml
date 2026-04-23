@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-protected-paths"
+version = "0.1.0"
+description = "Block writes to .env, secrets files, and sensitive paths"
+requires-python = ">=3.11"
+dependencies = ["aar-agent"]
+keywords = ["aar-extension"]
+license = {text = "Apache-2.0"}
+
+[project.entry-points."aar_extensions"]
+protected_paths = "aar_ext_protected_paths:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_protected_paths"]

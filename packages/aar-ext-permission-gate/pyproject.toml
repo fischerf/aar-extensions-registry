@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-permission-gate"
+version = "0.1.0"
+description = "Confirm before dangerous bash commands (rm -rf, sudo, etc.)"
+requires-python = ">=3.11"
+dependencies = ["aar-agent"]
+keywords = ["aar-extension"]
+license = {text = "Apache-2.0"}
+
+[project.entry-points."aar_extensions"]
+permission_gate = "aar_ext_permission_gate:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_permission_gate"]

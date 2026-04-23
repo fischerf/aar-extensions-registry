@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-git-checkpoint"
+version = "0.1.0"
+description = "Auto-commit or stash at turn boundaries for safe rollback"
+requires-python = ">= 3.11"
+dependencies = ["aar-agent"]
+keywords = ["aar-extension"]
+license = {text = "Apache-2.0"}
+
+[project.entry-points."aar_extensions"]
+git_checkpoint = "aar_ext_git_checkpoint:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_git_checkpoint"]
