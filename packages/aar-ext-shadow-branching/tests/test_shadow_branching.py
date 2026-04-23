@@ -6,6 +6,7 @@ than mocking git out. That matters because the protocol lives or dies by the
 real behaviour of ``git reset --hard``, ``git branch -m`` and
 ``git merge --squash``.
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,13 +17,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
 from aar_ext_shadow_branching import (
     _list_branches,
     _short_hash,
     register,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake ExtensionAPI / ExtensionContext — match the shape of the real API just
@@ -78,9 +77,7 @@ class FakeCtx:
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False
-    )
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
 
 
 def _init_repo(path: Path) -> None:
@@ -100,9 +97,17 @@ def _fire_tool_result(api: FakeAPI, ctx: FakeCtx, tool_name: str = "write_file")
         handler(event, ctx)
 
 
-def _run_cmd(api: FakeAPI, name: str, args: str, ctx: FakeCtx) -> None:
+def _fire_session_end(api: FakeAPI, ctx: FakeCtx) -> None:
+    from types import SimpleNamespace
+
+    event = SimpleNamespace(action="ended")
+    for handler in api.handlers.get("session_end", []):
+        handler(event, ctx)
+
+
+def _run_cmd(api: FakeAPI, name: str, args: str, ctx: FakeCtx) -> str | None:
     _, handler = api.commands[name]
-    handler(args, ctx)
+    return handler(args, ctx)
 
 
 def _session_state(ctx: FakeCtx) -> dict[str, Any]:
@@ -150,7 +155,9 @@ def test_register_sets_up_handlers_and_commands() -> None:
     assert any("shadow-branching" in part for part in api.system_prompt_parts)
 
 
-def test_session_start_creates_shadow_and_anchor(session_api: tuple[FakeAPI, FakeCtx, Path]) -> None:
+def test_session_start_creates_shadow_and_anchor(
+    session_api: tuple[FakeAPI, FakeCtx, Path],
+) -> None:
     _api, ctx, repo = session_api
 
     assert _short_hash("HEAD", cwd=repo)
@@ -213,6 +220,56 @@ def test_tool_result_creates_checkpoint(session_api) -> None:
     assert "aar-auto: write_file turn-1" in log
 
 
+def test_session_end_commits_dirty_jsonl(session_api) -> None:
+    """session_end must auto-commit files left dirty after store.save() (e.g. JSONL).
+
+    The transport writes the session JSONL *after* agent.run() returns, which is
+    after every extension event including tool_result.  Without the session_end
+    hook the working tree stays dirty between turns and /fork or /switch blocks."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "content")
+
+    # Simulate the transport writing the session JSONL after agent.run()
+    (repo / "session.jsonl").write_text('{"session_id": "s1"}\n')
+
+    # Verify it is actually dirty before session_end fires
+    rc, status, _ = (
+        subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True),
+        None,
+        None,
+    )
+    assert rc.stdout.strip(), "Expected dirty tree before session_end"
+
+    _fire_session_end(api, ctx)
+
+    # After session_end the tree must be clean
+    result = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    )
+    assert not result.stdout.strip(), "Working tree must be clean after session_end commit"
+
+    # The commit must use the aar-meta: prefix (not aar-auto:, not a checkpoint)
+    log = _git("log", "--oneline", cwd=repo).stdout
+    assert "aar-meta: session sync" in log
+
+    # turn_counter and checkpoints must be unchanged (it's not a checkpoint)
+    st = _session_state(ctx)
+    assert st["turn_counter"] == 1
+    assert len(st["checkpoints"]) == 1
+
+
+def test_session_end_no_op_when_clean(session_api) -> None:
+    """session_end must not create an empty commit when the tree is already clean."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "content")
+
+    log_before = _git("log", "--oneline", cwd=repo).stdout
+    _fire_session_end(api, ctx)
+    log_after = _git("log", "--oneline", cwd=repo).stdout
+
+    assert log_before == log_after, "No new commit should be created on a clean tree"
+
+
 def test_tool_result_no_changes_no_checkpoint(session_api) -> None:
     api, ctx, _repo = session_api
     _fire_tool_result(api, ctx, tool_name="read_file")
@@ -245,15 +302,16 @@ def test_undo_reverts_one_checkpoint(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
 
-    _run_cmd(api, "undo", "", ctx)
+    result = _run_cmd(api, "undo", "", ctx)
 
-    # b.txt is gone after reset
     assert not (repo / "b.txt").exists()
     assert (repo / "a.txt").exists()
-
     st = _session_state(ctx)
     assert st["turn_counter"] == 1
     assert len(st["checkpoints"]) == 1
+    assert result is not None
+    assert result.startswith("↩")
+    assert "1 checkpoint" in result
 
 
 def test_undo_n_reverts_multiple(session_api) -> None:
@@ -262,13 +320,63 @@ def test_undo_n_reverts_multiple(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
     _write_and_checkpoint(api, ctx, repo, "c.txt", "three")
 
-    _run_cmd(api, "undo", "2", ctx)
+    result = _run_cmd(api, "undo", "2", ctx)
 
     assert (repo / "a.txt").exists()
     assert not (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
     st = _session_state(ctx)
     assert st["turn_counter"] == 1
+    assert len(st["checkpoints"]) == 1
+    assert result is not None
+    assert result.startswith("↩")
+    assert "2 checkpoint" in result
+
+
+def test_fork_auto_commits_pending(session_api, caplog: pytest.LogCaptureFixture) -> None:
+    """Pending changes are auto-committed before /fork so git branch rename works."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    # Drop a pending file (session store write) before forking
+    (repo / "session.jsonl").write_text('{"event": "tool_result"}\n')
+
+    caplog.set_level(logging.DEBUG)
+    _run_cmd(api, "fork", "", ctx)
+
+    branches = set(_list_branches("aar/session-*", cwd=repo))
+    assert "aar/session-s1" in branches
+    assert "aar/session-s1-fork-1" in branches
+
+    # session.jsonl must be committed on the preserved fork branch
+    rc = subprocess.run(
+        ["git", "show", "aar/session-s1-fork-1:session.jsonl"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert rc.returncode == 0, (
+        "session.jsonl should have been auto-committed onto the preserved fork"
+    )
+
+
+def test_done_auto_commits_pending(session_api, caplog: pytest.LogCaptureFixture) -> None:
+    """Pending changes are auto-committed before /done so the dirty-tree guard is not hit."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    # Drop a pending file before /done
+    (repo / "session.jsonl").write_text('{"event": "done"}\n')
+
+    caplog.set_level(logging.INFO)
+    _run_cmd(api, "done", "", ctx)
+
+    # /done squashes and checks out the base branch — if we landed here cleanly
+    # there should be no "uncommitted changes present" warning.
+    assert not any("uncommitted changes present" in rec.getMessage() for rec in caplog.records)
+    # And the squash commit should be on main
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert current == "main"
 
 
 def test_undo_refuses_with_dirty_tree(session_api, caplog: pytest.LogCaptureFixture) -> None:
@@ -278,10 +386,13 @@ def test_undo_refuses_with_dirty_tree(session_api, caplog: pytest.LogCaptureFixt
     (repo / "dirty.txt").write_text("WIP", encoding="utf-8")
 
     caplog.set_level(logging.WARNING)
-    _run_cmd(api, "undo", "", ctx)
+    result = _run_cmd(api, "undo", "", ctx)
 
     assert (repo / "dirty.txt").exists()  # still there — not reset
     assert any("uncommitted changes" in rec.getMessage() for rec in caplog.records)
+    assert result is not None
+    assert result.startswith("✗")
+    assert "uncommitted" in result
 
 
 def test_undo_force_discards_dirty_tree(session_api) -> None:
@@ -301,9 +412,12 @@ def test_undo_beyond_available_checkpoints(session_api, caplog: pytest.LogCaptur
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
 
     caplog.set_level(logging.WARNING)
-    _run_cmd(api, "undo", "5", ctx)
+    result = _run_cmd(api, "undo", "9", ctx)
 
     assert any("cannot undo" in rec.getMessage() for rec in caplog.records)
+    assert result is not None
+    assert result.startswith("✗")
+    assert "1 checkpoint" in result
     st = _session_state(ctx)
     assert st["turn_counter"] == 1
 
@@ -313,9 +427,13 @@ def test_revert_is_alias_of_undo(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
 
-    _run_cmd(api, "revert", "1", ctx)
+    result = _run_cmd(api, "revert", "", ctx)
 
-    assert (repo / "a.txt").exists()
+    assert not (repo / "b.txt").exists()
+    st = _session_state(ctx)
+    assert st["turn_counter"] == 1
+    assert result is not None
+    assert result.startswith("↩")
     assert not (repo / "b.txt").exists()
 
 
@@ -328,7 +446,7 @@ def test_fork_preserves_current_and_starts_fresh(session_api) -> None:
     api, ctx, repo = session_api
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
 
-    _run_cmd(api, "fork", "", ctx)
+    result = _run_cmd(api, "fork", "", ctx)
 
     branches = set(_list_branches("aar/session-*", cwd=repo))
     assert "aar/session-s1" in branches  # new active
@@ -345,6 +463,10 @@ def test_fork_preserves_current_and_starts_fresh(session_api) -> None:
 
     st = _session_state(ctx)
     assert st["fork_counter"] == 1
+    assert result is not None
+    assert result.startswith("⑂")
+    assert "fork-1" in result
+    assert "aar/session-s1" in result
 
 
 def test_fork_back_n_rewinds(session_api) -> None:
@@ -353,7 +475,9 @@ def test_fork_back_n_rewinds(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
     _write_and_checkpoint(api, ctx, repo, "c.txt", "three")
 
-    _run_cmd(api, "fork", "2", ctx)
+    result = _run_cmd(api, "fork", "2", ctx)
+    assert result is not None
+    assert "rewound 2 checkpoint" in result
 
     # Only a.txt should remain on the active branch
     assert (repo / "a.txt").exists()
@@ -416,16 +540,87 @@ def test_fork_beyond_checkpoints_is_refused(session_api, caplog: pytest.LogCaptu
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
 
     caplog.set_level(logging.WARNING)
-    _run_cmd(api, "fork", "9", ctx)
+    result = _run_cmd(api, "fork", "9", ctx)
 
     assert any("cannot fork" in rec.getMessage() for rec in caplog.records)
     branches = _list_branches("aar/session-s1*", cwd=repo)
     assert branches == ["aar/session-s1"]  # unchanged
+    assert result is not None
+    assert result.startswith("✗")
+    assert "1 checkpoint" in result
 
 
 # ---------------------------------------------------------------------------
 # /switch
 # ---------------------------------------------------------------------------
+
+
+def test_switch_no_args_shows_hint(session_api) -> None:
+    """Calling /switch with no args must return a hint with current branch and targets."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _run_cmd(api, "fork", "", ctx)
+    _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
+
+    result = _run_cmd(api, "switch", "", ctx)
+
+    assert result is not None
+    assert "Current branch:" in result
+    assert "aar/session-s1" in result
+    assert "aar/session-s1-fork-1" in result
+    assert "Usage:" in result
+    # Must NOT have switched — still on the active shadow
+    st = _session_state(ctx)
+    assert st["shadow_branch"] == "aar/session-s1"
+
+
+def test_switch_main_shorthand_returns_to_canonical_shadow(session_api) -> None:
+    """'main', 'active', and 'shadow' keywords all switch back to the canonical
+    aar/session-<id> branch from a preserved fork."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _run_cmd(api, "fork", "", ctx)
+    _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
+
+    # Switch away to the preserved fork first
+    _run_cmd(api, "switch", "fork-1", ctx)
+    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1-fork-1"
+
+    # Switch back using 'main'
+    result = _run_cmd(api, "switch", "main", ctx)
+    assert result is not None
+    assert result.startswith("⇄")
+    st = _session_state(ctx)
+    assert st["shadow_branch"] == "aar/session-s1"
+    assert (repo / "b.txt").exists()
+
+
+def test_switch_active_shorthand(session_api) -> None:
+    """'active' keyword resolves to the canonical shadow branch."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _run_cmd(api, "fork", "", ctx)
+
+    _run_cmd(api, "switch", "fork-1", ctx)
+    result = _run_cmd(api, "switch", "active", ctx)
+
+    assert result is not None
+    assert result.startswith("⇄")
+    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1"
+
+
+def test_switch_shadow_shorthand(session_api) -> None:
+    """'shadow' keyword resolves to the canonical shadow branch."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _run_cmd(api, "fork", "", ctx)
+
+    _run_cmd(api, "switch", "fork-1", ctx)
+    result = _run_cmd(api, "switch", "shadow", ctx)
+
+    assert result is not None
+    assert result.startswith("⇄")
+    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1"
 
 
 def test_switch_between_forks(session_api) -> None:
@@ -440,7 +635,7 @@ def test_switch_between_forks(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "c.txt", "three")
 
     # Jump to the first fork using a bare numeric shorthand
-    _run_cmd(api, "switch", "1", ctx)
+    result = _run_cmd(api, "switch", "1", ctx)
     assert (repo / "a.txt").exists()
     assert not (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
@@ -448,36 +643,87 @@ def test_switch_between_forks(session_api) -> None:
     assert st["shadow_branch"] == "aar/session-s1-fork-1"
     assert st["turn_counter"] == 1
     assert len(st["checkpoints"]) == 1
+    assert result is not None
+    assert result.startswith("⇄")
+    assert "fork-1" in result
 
     # Jump to fork-2 using the fork-K shorthand
-    _run_cmd(api, "switch", "fork-2", ctx)
+    result = _run_cmd(api, "switch", "fork-2", ctx)
     assert (repo / "a.txt").exists()
     assert (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
     st = _session_state(ctx)
     assert st["shadow_branch"] == "aar/session-s1-fork-2"
     assert st["turn_counter"] == 2
+    assert result is not None
+    assert result.startswith("⇄")
+    assert "fork-2" in result
 
     # Jump back to the live branch using the full name
-    _run_cmd(api, "switch", "aar/session-s1", ctx)
+    result = _run_cmd(api, "switch", "aar/session-s1", ctx)
     assert (repo / "c.txt").exists()
     st = _session_state(ctx)
     assert st["shadow_branch"] == "aar/session-s1"
     assert st["turn_counter"] == 3
+    assert result is not None
+    assert result.startswith("⇄")
 
 
-def test_switch_refuses_dirty_tree(session_api, caplog: pytest.LogCaptureFixture) -> None:
+def test_switch_auto_commits_pending_and_succeeds(
+    session_api, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pending (uncommitted) changes — e.g. session JSONL writes — are auto-committed
+    before /switch so the command is not blocked by a dirty working tree."""
     api, ctx, repo = session_api
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _run_cmd(api, "fork", "", ctx)
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
-    (repo / "dirty.txt").write_text("WIP")
+    # Simulate a session-store write that lands outside of tool_result
+    (repo / "session.jsonl").write_text('{"event": "message"}\n')
+
+    caplog.set_level(logging.DEBUG)
+    _run_cmd(api, "switch", "fork-1", ctx)
+
+    # Switch must have succeeded
+    st = _session_state(ctx)
+    assert st["shadow_branch"] == "aar/session-s1-fork-1"
+    assert (repo / "a.txt").exists()
+    assert not (repo / "b.txt").exists()
+
+    # The pending file must have been committed on the shadow branch, not left dirty
+    _git("checkout", "aar/session-s1", cwd=repo)
+    rc = subprocess.run(
+        ["git", "show", "HEAD:session.jsonl"], cwd=repo, capture_output=True, text=True
+    )
+    assert rc.returncode == 0, "session.jsonl should have been auto-committed"
+
+
+def test_switch_still_warns_on_truly_dirty_after_auto_commit_failure(
+    session_api, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the auto-commit itself fails (e.g. git commit errors out), the dirty-tree
+    warning must still be emitted and the switch must not proceed."""
+    import aar_ext_shadow_branching as ext
+
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _run_cmd(api, "fork", "", ctx)
+    _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
+    (repo / "session.jsonl").write_text('{"event": "message"}\n')
+
+    original_run_git = ext._run_git
+
+    def _failing_commit(*args, **kwargs):
+        if args and args[0] == "commit":
+            return 1, "", "simulated commit failure"
+        return original_run_git(*args, **kwargs)
+
+    monkeypatch.setattr(ext, "_run_git", _failing_commit)
 
     caplog.set_level(logging.WARNING)
     _run_cmd(api, "switch", "fork-1", ctx)
 
     assert any("uncommitted changes" in rec.getMessage() for rec in caplog.records)
-    # We did not switch
     st = _session_state(ctx)
     assert st["shadow_branch"] == "aar/session-s1"
 
@@ -485,8 +731,11 @@ def test_switch_refuses_dirty_tree(session_api, caplog: pytest.LogCaptureFixture
 def test_switch_unknown_branch(session_api, caplog: pytest.LogCaptureFixture) -> None:
     api, ctx, _repo = session_api
     caplog.set_level(logging.WARNING)
-    _run_cmd(api, "switch", "nonexistent", ctx)
+    result = _run_cmd(api, "switch", "nonexistent", ctx)
     assert any("does not exist" in rec.getMessage() for rec in caplog.records)
+    assert result is not None
+    assert result.startswith("✗")
+    assert "does not exist" in result
 
 
 # ---------------------------------------------------------------------------
@@ -504,17 +753,20 @@ def test_forks_lists_all_branches_and_marks_active(
     _run_cmd(api, "fork", "", ctx)
 
     caplog.set_level(logging.INFO)
-    _run_cmd(api, "forks", "", ctx)
+    result = _run_cmd(api, "forks", "", ctx)
 
-    msgs = [rec.getMessage() for rec in caplog.records]
-    joined = "\n".join(msgs)
-    assert "aar/session-s1" in joined
-    assert "aar/session-s1-fork-1" in joined
-    assert "aar/session-s1-fork-2" in joined
+    # The return value is the canonical output shown in the TUI/CLI
+    assert result is not None
+    assert "aar/session-s1" in result
+    assert "aar/session-s1-fork-1" in result
+    assert "aar/session-s1-fork-2" in result
     # active marker present on exactly one line
-    active_lines = [m for m in msgs if "(active)" in m]
+    active_lines = [line for line in result.splitlines() if "◀ active" in line]
     assert len(active_lines) == 1
     assert "aar/session-s1" in active_lines[0] and "fork-" not in active_lines[0]
+    # log still emitted for the record
+    msgs = [rec.getMessage() for rec in caplog.records]
+    assert any("aar/session-s1" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +779,7 @@ def test_done_squashes_shadow_into_base(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
 
-    _run_cmd(api, "done", "finishing up", ctx)
+    result = _run_cmd(api, "done", "finishing up", ctx)
 
     # Now on main with a single new commit
     current = subprocess.run(
@@ -543,23 +795,28 @@ def test_done_squashes_shadow_into_base(session_api) -> None:
     assert "finishing up" in log
     # No aar-auto commits on main (they were squashed)
     assert "aar-auto:" not in log
+    assert result is not None
+    assert result.startswith("✓")
+    assert "main" in result
 
 
-def test_done_refuses_with_remaining_forks(
-    session_api, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_done_refuses_with_remaining_forks(session_api, caplog: pytest.LogCaptureFixture) -> None:
     api, ctx, repo = session_api
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _run_cmd(api, "fork", "", ctx)
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
 
     caplog.set_level(logging.INFO)
-    _run_cmd(api, "done", "", ctx)
+    result = _run_cmd(api, "done", "", ctx)
     # still on the shadow branch because /done aborted
     current = subprocess.run(
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
     assert current == "aar/session-s1"
+    assert result is not None
+    assert result.startswith("⚠")
+    assert "fork" in result
+    assert "--yes" in result
     assert any("fork branches still exist" in rec.getMessage() for rec in caplog.records)
 
 
@@ -569,56 +826,62 @@ def test_done_with_yes_proceeds_despite_forks(session_api) -> None:
     _run_cmd(api, "fork", "", ctx)
     _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
 
-    _run_cmd(api, "done", "--yes merged", ctx)
+    result = _run_cmd(api, "done", "--yes", ctx)
 
     current = subprocess.run(
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
     assert current == "main"
+    assert "aar/session-s1-fork-1" in _list_branches("aar/session-s1*", cwd=repo)
+    assert result is not None
+    assert result.startswith("✓")
+    assert "main" in result
     # b.txt from the active shadow is on main, but fork branches still exist
     assert (repo / "b.txt").exists()
     branches = _list_branches("aar/session-*", cwd=repo)
     assert "aar/session-s1-fork-1" in branches
 
 
-def test_done_aborts_on_merge_conflict(
-    session_api, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_done_aborts_on_merge_conflict(session_api, caplog: pytest.LogCaptureFixture) -> None:
     api, ctx, repo = session_api
 
     # Diverge: edit shared file on shadow
     _write_and_checkpoint(api, ctx, repo, "README.md", "shadow version\n")
 
-    # Meanwhile, simulate a concurrent change on main
+    # Now edit the same file on main so merge will conflict
     _git("checkout", "main", cwd=repo)
     (repo / "README.md").write_text("main version\n", encoding="utf-8")
-    _git("commit", "-am", "conflicting change on main", cwd=repo)
-
-    # Go back to shadow to trigger /done
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "main edit", cwd=repo)
     _git("checkout", "aar/session-s1", cwd=repo)
 
     caplog.set_level(logging.WARNING)
-    _run_cmd(api, "done", "--yes", ctx)
+    result = _run_cmd(api, "done", "--yes", ctx)
 
     # No new merge commit — we are on main with a conflict marker present
-    assert any(
-        "merge conflicts" in rec.getMessage() for rec in caplog.records
-    ), "expected conflict warning"
+    assert any("merge conflicts" in rec.getMessage() for rec in caplog.records), (
+        "expected conflict warning"
+    )
     # Check that the working tree actually shows conflicts
     status = _git("status", "--porcelain", cwd=repo).stdout
     assert "UU" in status or "AA" in status or "DD" in status or "README.md" in status
+    assert result is not None
+    assert result.startswith("✗")
+    assert "conflict" in result
 
 
 def test_done_no_message_uses_default(session_api) -> None:
     api, ctx, repo = session_api
-    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "content")
 
-    _run_cmd(api, "done", "", ctx)
+    result = _run_cmd(api, "done", "", ctx)
 
     log = subprocess.run(
         ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
     ).stdout
     assert "aar: squashed session s1" in log
+    assert result is not None
+    assert result.startswith("✓")
 
 
 # ---------------------------------------------------------------------------

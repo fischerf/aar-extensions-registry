@@ -108,9 +108,7 @@ def _short_hash(ref: str = "HEAD", cwd: str | Path | None = None) -> str:
 
 
 def _list_branches(pattern: str, cwd: str | Path | None = None) -> list[str]:
-    rc, out, _ = _run_git(
-        "branch", "--list", pattern, "--format=%(refname:short)", cwd=cwd
-    )
+    rc, out, _ = _run_git("branch", "--list", pattern, "--format=%(refname:short)", cwd=cwd)
     if rc != 0 or not out:
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
@@ -131,14 +129,10 @@ def _next_fork_n(session_id: str, cwd: str | Path | None = None) -> int:
     return max_n + 1
 
 
-def _read_anchor_base(
-    branch: str, fallback: str, cwd: str | Path | None = None
-) -> str:
+def _read_anchor_base(branch: str, fallback: str, cwd: str | Path | None = None) -> str:
     """Return the base branch recorded in the ``aar-init`` anchor commit of
     *branch* (falls back to *fallback* when no anchor is present)."""
-    rc, out, _ = _run_git(
-        "log", "--grep=^aar-init:", "--pretty=%s", branch, cwd=cwd
-    )
+    rc, out, _ = _run_git("log", "--grep=^aar-init:", "--pretty=%s", branch, cwd=cwd)
     if rc != 0 or not out:
         return fallback
     # Prefer the oldest aar-init commit on the branch
@@ -218,9 +212,7 @@ def register(api: Any) -> None:
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
         """Count aar-auto commits on *branch* and build a checkpoint list."""
-        rc, out, _ = _run_git(
-            "log", "--reverse", "--format=%h %s", branch
-        )
+        rc, out, _ = _run_git("log", "--reverse", "--format=%h %s", branch)
         if rc != 0 or not out:
             return 0, []
         turn = 0
@@ -242,6 +234,36 @@ def register(api: Any) -> None:
                 pass
             ckpts.append({"turn": turn, "hash": sha, "tool": tool})
         return turn, ckpts
+
+    def _auto_commit_pending(ctx: Any, label: str = "session sync") -> bool:
+        """Commit any uncommitted changes with an aar-meta message.
+
+        This sweeps up session JSONL writes (and any other minor file changes that
+        haven't been captured by a checkpoint yet) so that commands like /fork,
+        /switch, and /done don't get blocked by a dirty working tree caused purely
+        by the session store being updated outside of git.
+
+        Returns True if a commit was made, False if the tree was already clean or
+        the commit failed.
+        """
+        if not _has_changes():
+            return False
+        _run_git("add", "-A")
+        rc, _, err = _run_git(
+            "commit",
+            "-m",
+            f"aar-meta: {label}",
+            "--no-verify",
+        )
+        if rc != 0:
+            ctx.logger.warning("shadow-branching: auto-commit of pending changes failed: %s", err)
+            return False
+        ctx.logger.debug(
+            "shadow-branching: auto-committed pending changes (%s) → %s",
+            label,
+            _short_hash("HEAD"),
+        )
+        return True
 
     def _parse_int_arg(args: str) -> tuple[int | None, set[str]]:
         """Return (integer N or None, set of flag tokens like {'--force'})."""
@@ -273,9 +295,7 @@ def register(api: Any) -> None:
                 Path(".aar_backups").mkdir(exist_ok=True)
             except Exception as exc:
                 ctx.logger.warning("shadow-branching: cannot create .aar_backups/: %s", exc)
-            state = ShadowState(
-                session_id=session_id, enabled=False, mode="fallback"
-            )
+            state = ShadowState(session_id=session_id, enabled=False, mode="fallback")
             ctx.logger.info(
                 "shadow-branching: no git repo — using .aar_backups/ fallback (checkpoints disabled)"
             )
@@ -315,9 +335,7 @@ def register(api: Any) -> None:
             # Resuming this exact session — reconstruct state from git log.
             rc, _, err = _run_git("checkout", shadow_name)
             if rc != 0:
-                ctx.logger.warning(
-                    "shadow-branching: cannot resume %s: %s", shadow_name, err
-                )
+                ctx.logger.warning("shadow-branching: cannot resume %s: %s", shadow_name, err)
                 state = ShadowState(session_id=session_id, enabled=False)
                 _sync_metadata(ctx)
                 return
@@ -332,8 +350,7 @@ def register(api: Any) -> None:
                 turn_counter=turn,
                 checkpoints=ckpts,
                 fork_counter=max(0, fork_counter),
-                base_anchor=_short_hash(shadow_name + "^{/^aar-init:}")
-                or _short_hash("HEAD"),
+                base_anchor=_short_hash(shadow_name + "^{/^aar-init:}") or _short_hash("HEAD"),
             )
             ctx.logger.info(
                 "shadow-branching: resumed %s (base=%s, %d checkpoint(s))",
@@ -369,9 +386,7 @@ def register(api: Any) -> None:
             "--no-verify",
         )
         if rc != 0:
-            ctx.logger.warning(
-                "shadow-branching: failed to create aar-init anchor: %s", err
-            )
+            ctx.logger.warning("shadow-branching: failed to create aar-init anchor: %s", err)
 
         anchor = _short_hash("HEAD")
         state = ShadowState(
@@ -387,6 +402,23 @@ def register(api: Any) -> None:
             anchor,
         )
         _sync_metadata(ctx)
+
+    # ------------------------------------------------------------------
+    # session_end — sweep up any dirty files left after agent.run() + store.save()
+    # ------------------------------------------------------------------
+
+    @api.on("session_end")
+    def on_session_end(event: Any, ctx: Any) -> None:
+        """Commit any files that were written after the last tool_result checkpoint.
+
+        The session JSONL is saved by the transport *after* the agent loop ends
+        (and therefore after every tool_result event). This means each completed
+        turn leaves the JSONL dirty in git. We commit it here with an
+        ``aar-meta: session sync`` message so the working tree stays clean and
+        commands like /fork and /switch never block on pending changes."""
+        if state is None or not state.enabled:
+            return
+        _auto_commit_pending(ctx, "session sync")
 
     # ------------------------------------------------------------------
     # tool_result — snapshot changes
@@ -421,16 +453,12 @@ def register(api: Any) -> None:
             "--no-verify",
         )
         if rc != 0:
-            ctx.logger.warning(
-                "shadow-branching: checkpoint commit failed: %s", err
-            )
+            ctx.logger.warning("shadow-branching: checkpoint commit failed: %s", err)
             state.turn_counter = prev_turn
             return
 
         sha = _short_hash("HEAD")
-        state.checkpoints.append(
-            {"turn": state.turn_counter, "hash": sha, "tool": tool_name}
-        )
+        state.checkpoints.append({"turn": state.turn_counter, "hash": sha, "tool": tool_name})
         ctx.logger.info(
             "[CHECKPOINT turn=%d hash=%s tool=%s]",
             state.turn_counter,
@@ -443,10 +471,10 @@ def register(api: Any) -> None:
     # /undo  /revert
     # ------------------------------------------------------------------
 
-    def _do_undo(args: str, ctx: Any) -> None:
+    def _do_undo(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
             ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return
+            return "✗ shadow-branching disabled (no git repo or identity)"
 
         n, flags = _parse_int_arg(args)
         n = n if n and n >= 1 else 1
@@ -458,7 +486,7 @@ def register(api: Any) -> None:
                 n,
                 len(state.checkpoints),
             )
-            return
+            return f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot undo {n}"
 
         dirty = _has_changes()
         if dirty and not force:
@@ -466,12 +494,12 @@ def register(api: Any) -> None:
                 "shadow-branching: uncommitted changes present — "
                 "commit/stash them, or re-run with --force to discard."
             )
-            return
+            return "✗ uncommitted changes present — commit/stash or use --force"
 
         rc, _, err = _run_git("reset", "--hard", f"HEAD~{n}")
         if rc != 0:
             ctx.logger.warning("shadow-branching: git reset failed: %s", err)
-            return
+            return f"✗ git reset failed: {err}"
 
         # ``git reset --hard`` only touches tracked changes; untracked files
         # linger. When --force was requested the user accepted losing
@@ -482,21 +510,25 @@ def register(api: Any) -> None:
         removed = state.checkpoints[-n:]
         state.checkpoints = state.checkpoints[:-n]
         state.turn_counter = max(0, state.turn_counter - n)
+        sha = _short_hash("HEAD")
         ctx.logger.info(
             "shadow-branching: reverted %d checkpoint(s), now at %s (removed turns %s)",
             n,
-            _short_hash("HEAD"),
+            sha,
             [c["turn"] for c in removed],
         )
         _sync_metadata(ctx)
+        return f"↩ reverted {n} checkpoint(s) → {sha}"
 
-    @api.command("undo", description="Revert N checkpoints (default 1). Use --force with dirty tree.")
-    def cmd_undo(args: str, ctx: Any) -> None:
-        _do_undo(args, ctx)
+    @api.command(
+        "undo", description="Revert N checkpoints (default 1). Use --force with dirty tree."
+    )
+    def cmd_undo(args: str, ctx: Any) -> str | None:
+        return _do_undo(args, ctx)
 
     @api.command("revert", description="Alias for /undo")
-    def cmd_revert(args: str, ctx: Any) -> None:
-        _do_undo(args, ctx)
+    def cmd_revert(args: str, ctx: Any) -> str | None:
+        return _do_undo(args, ctx)
 
     # ------------------------------------------------------------------
     # /fork
@@ -506,11 +538,16 @@ def register(api: Any) -> None:
         "fork",
         description="Preserve current shadow as aar/session-<id>-fork-<K> and branch fresh (optionally from N back).",
     )
-    def cmd_fork(args: str, ctx: Any) -> None:
+    def cmd_fork(args: str, ctx: Any) -> str | None:
         nonlocal state
         if state is None or not state.enabled:
             ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return
+            return "✗ shadow-branching disabled (no git repo or identity)"
+
+        # Sweep up any session-store writes (JSONL etc.) that happened outside
+        # of tool_result checkpoints so the working tree is clean before we
+        # rename branches and create a new one.
+        _auto_commit_pending(ctx, "pre-fork sync")
 
         n, _ = _parse_int_arg(args)
         if n is not None and n > len(state.checkpoints):
@@ -519,16 +556,14 @@ def register(api: Any) -> None:
                 len(state.checkpoints),
                 n,
             )
-            return
+            return f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot fork {n} back"
 
         # Resolve fork point before rename so HEAD~N is still valid.
         fork_ref = f"HEAD~{n}" if n else "HEAD"
         rc, fork_sha, err = _run_git("rev-parse", fork_ref)
         if rc != 0:
-            ctx.logger.warning(
-                "shadow-branching: cannot resolve fork point %s: %s", fork_ref, err
-            )
-            return
+            ctx.logger.warning("shadow-branching: cannot resolve fork point %s: %s", fork_ref, err)
+            return f"✗ cannot resolve fork point {fork_ref}: {err}"
 
         fork_n = _next_fork_n(state.session_id)
         preserved = f"{state.shadow_branch}-fork-{fork_n}"
@@ -536,7 +571,7 @@ def register(api: Any) -> None:
         rc, _, err = _run_git("branch", "-m", state.shadow_branch, preserved)
         if rc != 0:
             ctx.logger.warning("shadow-branching: branch rename failed: %s", err)
-            return
+            return f"✗ branch rename failed: {err}"
 
         rc, _, err = _run_git("checkout", "-b", state.shadow_branch, fork_sha)
         if rc != 0:
@@ -547,7 +582,7 @@ def register(api: Any) -> None:
                 fork_sha[:8],
                 err,
             )
-            return
+            return f"✗ cannot start new branch at {fork_sha[:8]}: {err}"
 
         state.fork_counter = fork_n
         if n:
@@ -561,6 +596,10 @@ def register(api: Any) -> None:
             fork_sha[:8],
         )
         _sync_metadata(ctx)
+        suffix = f" (rewound {n} checkpoint(s))" if n else ""
+        return (
+            f"⑂ fork-{fork_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
+        )
 
     # ------------------------------------------------------------------
     # /switch
@@ -568,41 +607,63 @@ def register(api: Any) -> None:
 
     @api.command(
         "switch",
-        description="Switch to another aar/session-<id>* branch (pass full name or shorthand fork-<K>).",
+        description=(
+            "Switch to another aar/session-<id>* branch. "
+            "Shorthands: fork-<K> or bare <K> for a fork, "
+            "'main'/'active'/'shadow' for the canonical shadow branch. "
+            "No args: show current branch and available targets."
+        ),
     )
-    def cmd_switch(args: str, ctx: Any) -> None:
+    def cmd_switch(args: str, ctx: Any) -> str | None:
         nonlocal state
         if state is None or not state.enabled:
             ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return
+            return "✗ shadow-branching disabled (no git repo or identity)"
 
         target = args.strip()
-        if not target:
-            ctx.logger.warning("shadow-branching: /switch requires a branch name")
-            return
 
-        # Shorthand: "fork-3" or just "3" → aar/session-<id>-fork-3
-        if target.isdigit():
-            target = f"aar/session-{state.session_id}-fork-{target}"
+        # No args → show current branch + available targets as a hint.
+        if not target:
+            branches = _list_branches(f"aar/session-{state.session_id}*")
+            canonical = f"aar/session-{state.session_id}"
+            lines = [f"Current branch: {state.shadow_branch}"]
+            lines.append("Available targets:")
+            for b in branches:
+                marker = " ◀ active" if b == state.shadow_branch else ""
+                lines.append(f"  {b}{marker}")
+            lines.append("Usage: /switch <fork-K | K | main | full-branch-name>")
+            return "\n".join(lines)
+
+        # Sweep up session-store writes before checking for a clean tree.
+        _auto_commit_pending(ctx, "pre-switch sync")
+
+        # Canonical shadow branch shorthands
+        canonical = f"aar/session-{state.session_id}"
+        if target in {"main", "active", "shadow"}:
+            target = canonical
+
+        # Numeric / fork-K / other shorthands → aar/session-<id>-fork-K
+        elif target.isdigit():
+            target = f"{canonical}-fork-{target}"
         elif target.startswith("fork-"):
-            target = f"aar/session-{state.session_id}-{target}"
+            target = f"{canonical}-{target}"
         elif not target.startswith("aar/session-"):
-            target = f"aar/session-{state.session_id}-{target}"
+            target = f"{canonical}-{target}"
 
         if not _branch_exists(target):
             ctx.logger.warning("shadow-branching: branch %r does not exist", target)
-            return
+            return f"✗ branch {target!r} does not exist"
 
         if _has_changes():
             ctx.logger.warning(
                 "shadow-branching: uncommitted changes — commit or stash before /switch"
             )
-            return
+            return "✗ uncommitted changes present — commit/stash or let auto-commit run first"
 
         rc, _, err = _run_git("checkout", target)
         if rc != 0:
             ctx.logger.warning("shadow-branching: checkout failed: %s", err)
-            return
+            return f"✗ checkout failed: {err}"
 
         base = _read_anchor_base(target, state.original_branch or "main")
         turn, ckpts = _reconstruct_from_branch(target)
@@ -617,16 +678,17 @@ def register(api: Any) -> None:
             turn,
         )
         _sync_metadata(ctx)
+        return f"⇄ switched to {target} (base={base}, {turn} checkpoint(s))"
 
     # ------------------------------------------------------------------
     # /forks
     # ------------------------------------------------------------------
 
     @api.command("forks", description="List all shadow/fork branches for this session.")
-    def cmd_forks(args: str, ctx: Any) -> None:
+    def cmd_forks(args: str, ctx: Any) -> str | None:
         if state is None:
             ctx.logger.info("shadow-branching: not initialised")
-            return
+            return "✗ shadow-branching not initialised"
 
         branches = _list_branches(f"aar/session-{state.session_id}*")
         if not branches:
@@ -634,11 +696,14 @@ def register(api: Any) -> None:
                 "shadow-branching: no shadow branches found for session %s",
                 state.session_id,
             )
-            return
+            return f"no branches found for session {state.session_id}"
 
+        lines: list[str] = []
         for b in branches:
-            marker = " (active)" if b == state.shadow_branch else ""
-            ctx.logger.info("  * %s%s", b, marker)
+            marker = " ◀ active" if b == state.shadow_branch else ""
+            lines.append(f"  {b}{marker}")
+            ctx.logger.info("  * %s%s", b, " (active)" if marker else "")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # /done
@@ -648,16 +713,19 @@ def register(api: Any) -> None:
         "done",
         description="Squash-merge the active shadow branch into its recorded base; aborts on conflicts.",
     )
-    def cmd_done(args: str, ctx: Any) -> None:
+    def cmd_done(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
             ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return
+            return "✗ shadow-branching disabled (no git repo or identity)"
+
+        # Sweep up session-store writes before checking for a clean tree.
+        _auto_commit_pending(ctx, "pre-done sync")
 
         if _has_changes():
             ctx.logger.warning(
                 "shadow-branching: uncommitted changes present — commit or stash before /done"
             )
-            return
+            return "✗ uncommitted changes present — commit/stash or let auto-commit run first"
 
         _, flags = _parse_int_arg(args)
         # extract custom message — anything left after flags/ints
@@ -679,33 +747,32 @@ def register(api: Any) -> None:
                 "Pass --yes to squash only the active shadow and leave forks intact.",
                 ", ".join(forks),
             )
-            return
+            return f"⚠ fork branches still exist: {', '.join(forks)} — pass --yes to proceed"
 
         base = _read_anchor_base(state.shadow_branch, state.original_branch or "main")
 
         rc, _, err = _run_git("checkout", base)
         if rc != 0:
-            ctx.logger.warning(
-                "shadow-branching: cannot checkout base %s: %s", base, err
-            )
-            return
+            ctx.logger.warning("shadow-branching: cannot checkout base %s: %s", base, err)
+            return f"✗ cannot checkout base branch {base!r}: {err}"
 
         rc, _, err = _run_git("merge", "--squash", state.shadow_branch)
 
         # Check for unresolved conflicts regardless of rc, then fall through.
         rc_u, conflicts, _ = _run_git("diff", "--name-only", "--diff-filter=U")
         if conflicts.strip():
+            conflict_list = conflicts.strip().replace("\n", ", ")
             ctx.logger.warning(
                 "shadow-branching: merge conflicts in: %s — resolve them and commit manually.",
-                conflicts.strip().replace("\n", ", "),
+                conflict_list,
             )
-            return
+            return f"✗ merge conflicts in: {conflict_list} — resolve manually then commit"
 
         if rc != 0:
             ctx.logger.warning(
                 "shadow-branching: git merge --squash failed: %s", err or "(no output)"
             )
-            return
+            return f"✗ git merge --squash failed: {err or '(no output)'}"
 
         if not message:
             message = f"aar: squashed session {state.session_id}"
@@ -717,15 +784,17 @@ def register(api: Any) -> None:
                 "shadow-branching: final commit failed: %s (nothing to commit?)",
                 err,
             )
-            return
+            return f"✗ final commit failed: {err} (nothing to commit?)"
 
+        sha = _short_hash("HEAD")
         ctx.logger.info(
             "shadow-branching: merged %s into %s as %s",
             state.shadow_branch,
             base,
-            _short_hash("HEAD"),
+            sha,
         )
         _sync_metadata(ctx)
+        return f"✓ squashed {state.shadow_branch} → {base} as {sha}"
 
     # ------------------------------------------------------------------
     # System prompt additions

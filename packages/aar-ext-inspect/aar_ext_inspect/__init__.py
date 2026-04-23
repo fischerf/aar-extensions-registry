@@ -68,9 +68,18 @@ def register(api: ExtensionAPI) -> None:
     """Register the /inspect slash-command."""
 
     @api.command("inspect", description="Analyse the current session and print a summary report")
-    def inspect_command(args: str, ctx: ExtensionContext) -> None:
+    def inspect_command(args: str, ctx: ExtensionContext) -> str:
         session = ctx.session
         cfg = ctx.config
+
+        # Guard: session object is None or has no session_id (can happen when
+        # the extension context still holds the internal bootstrap placeholder
+        # and update_session() has not been called yet).
+        if session is None or not getattr(session, "session_id", None):
+            report = "No active session — send a message or resume a session first."
+            ctx.logger.info(report)
+            return report
+
         lines: list[str] = []
 
         lines.append("=== Session Inspect Report ===")
@@ -228,4 +237,6 @@ def register(api: ExtensionAPI) -> None:
                     lines.append(f"  [{i:>2}] <uninspectable event>")
 
         lines.append("=== End Report ===")
-        ctx.logger.info("\n".join(lines))
+        report = "\n".join(lines)
+        ctx.logger.info(report)
+        return report
