@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-inspect"
+version = "0.1.0"
+description = "Slash-commands extension that adds a /inspect command to analyze the current session and print a human-readable report."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aar",
+]
+keywords = ["aar-extension", "ui", "observability"]
+authors = [
+    { name = "Aar Extension Author", email = "dev@example.com" }
+]
+license = { text = "MIT" }
+
+[project.urls]
+"Home" = "https://example.org/aar-ext-inspect"
+"Repository" = "https://example.org/aar-ext-inspect"
+
+[project.entry-points."aar_extensions"]
+inspect = "aar_ext_inspect:register"
+
+[tool.hatch.build]
+include = ["aar_ext_inspect/**", "README.md"]
