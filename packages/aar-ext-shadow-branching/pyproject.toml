@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-shadow-branching"
+version = "0.1.0"
+description = "Session-scoped git isolation with checkpoints, forks, and safe merge-back for Aar agent sessions."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aar"]
+keywords = ["aar-extension", "git", "safety", "slash-commands"]
+license = { text = "MIT" }
+
+[project.urls]
+"Home" = "https://github.com/fischerf/aar"
+"Repository" = "https://github.com/fischerf/aar"
+
+[project.entry-points."aar_extensions"]
+shadow_branching = "aar_ext_shadow_branching:register"
+
+[tool.hatch.build]
+include = ["aar_ext_shadow_branching/**", "README.md"]
