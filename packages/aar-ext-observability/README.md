@@ -19,3 +19,11 @@ pip install aar-ext-observability
 ## Output format
 
 See the extension source code for the full JSON metrics schema.
+
+---
+
+## License
+
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---

@@ -124,6 +124,6 @@ Suggested improvements:
 
 ## License
 
-MIT. See LICENSE or the `pyproject.toml` for packaging metadata.
+See LICENSE or the `pyproject.toml` for packaging metadata.
 
 ---

@@ -132,4 +132,6 @@ group — no configuration changes needed.
 
 ## License
 
-MIT.
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---

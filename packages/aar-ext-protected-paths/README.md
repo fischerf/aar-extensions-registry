@@ -23,3 +23,11 @@ Hooks into `tool_call` events for `write_file` and `edit_file`, blocking writes 
 ## Customization
 
 Fork and edit `PROTECTED_PATTERNS` in `__init__.py` to add/remove patterns.
+
+---
+
+## License
+
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---

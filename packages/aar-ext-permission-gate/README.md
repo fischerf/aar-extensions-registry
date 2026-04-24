@@ -22,3 +22,11 @@ Hooks into `tool_call` events and blocks bash commands containing dangerous patt
 ## Customization
 
 Fork and edit `DANGEROUS_PATTERNS` in `__init__.py` to add/remove patterns.
+
+---
+
+## License
+
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---

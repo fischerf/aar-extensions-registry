@@ -41,3 +41,11 @@ Requires the `mcp` package: `pip install "aar-agent[mcp]"`
 This is a reference implementation. Aar's built-in `agent.extensions.mcp` module
 provides the same functionality without the extension API. Use this extension when
 you want MCP tools managed by the extension lifecycle.
+
+---
+
+## License
+
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---

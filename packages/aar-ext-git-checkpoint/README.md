@@ -21,3 +21,11 @@ aar install aar-ext-git-checkpoint
 ## Notes
 
 Checkpoints are regular git commits. You can squash them later with `git rebase -i`.
+
+---
+
+## License
+
+See LICENSE or the `pyproject.toml` for packaging metadata.
+
+---
