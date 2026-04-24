@@ -19,17 +19,25 @@ Implements the Shadow Branching Protocol:
     /undo [N] [--force]   Revert N checkpoints (default 1). Refuses to touch a
                           dirty working tree unless ``--force`` is passed.
     /revert N             Alias for ``/undo``.
-    /fork [N]             Preserve the active shadow branch as
-                          ``aar/session-<id>-fork-<K>`` and branch a fresh shadow
-                          from ``HEAD~N`` (or ``HEAD`` if no N given). Fork
+    /branch [N]           Preserve the active shadow branch as
+                          ``aar/session-<id>-branch-<K>`` and start a fresh shadow
+                          from ``HEAD~N`` (or ``HEAD`` if no N given). Branch
                           numbering is derived from the branches that already
                           exist on disk, so it survives session reloads and
-                          forks-of-forks.
+                          branch-of-branch chains.
     /switch <branch>      Switch to any existing ``aar/session-<id>*`` branch.
                           Accepts bare branch names or the shorthand
-                          ``fork-<K>``. Refuses to switch with a dirty tree.
-    /forks                List every shadow/fork branch belonging to this
-                          session and mark the active one.
+                          ``branch-<K>``. Refuses to switch with a dirty tree.
+    /branches             List every shadow/branch copy belonging to this
+                          session and mark the active one, as a tree.
+
+All state is also mirrored into ``session.metadata['shadow_branching']`` so the
+session JSONL store keeps a faithful record across resumes.
+
+A ``before_turn`` hook commits any JSONL or other files written by the transport
+after the previous turn completed, keeping the working tree clean so that
+``/branch``, ``/switch``, and ``/done`` are never blocked by a dirty tree caused
+purely by session bookkeeping.
     /done                 Squash-merge the active shadow branch back into the
                           base branch captured in ``aar-init``. Aborts cleanly
                           on merge conflicts and names the files that need
@@ -41,6 +49,7 @@ session JSONL store keeps a faithful record across resumes.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -48,20 +57,32 @@ from typing import Any
 
 __all__ = ["register", "ShadowState"]
 
+_module_logger = logging.getLogger("aar_ext_shadow_branching")
+
 
 # ---------------------------------------------------------------------------
 # git helpers — thin wrappers so tests can drive a real temp repo
 # ---------------------------------------------------------------------------
 
 
-def _run_git(*args: str, cwd: str | Path | None = None) -> tuple[int, str, str]:
+# Default per-call timeout. `git add -A` on a working tree that includes a
+# Python ``venv/`` or a JS ``node_modules/`` can easily take much longer than
+# the 15 s originally allowed here — when that timeout tripped silently the
+# extension happily created a /branch that did not actually contain the user's
+# work. 120 s covers realistic large-tree cases while still bounding hangs.
+_GIT_TIMEOUT = 120
+
+
+def _run_git(
+    *args: str, cwd: str | Path | None = None, timeout: int | None = None
+) -> tuple[int, str, str]:
     """Run a git command; return (returncode, stdout, stderr) — stripped."""
     try:
         result = subprocess.run(
             ["git", *args],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=timeout if timeout is not None else _GIT_TIMEOUT,
             cwd=str(cwd) if cwd is not None else None,
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
@@ -114,13 +135,13 @@ def _list_branches(pattern: str, cwd: str | Path | None = None) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _next_fork_n(session_id: str, cwd: str | Path | None = None) -> int:
-    """Largest existing fork number for this session + 1. Derived from disk
-    state so numbering survives session reloads and fork-of-fork chains."""
-    branches = _list_branches(f"aar/session-{session_id}-fork-*", cwd=cwd)
+def _next_branch_n(session_id: str, cwd: str | Path | None = None) -> int:
+    """Largest existing branch number for this session + 1. Derived from disk
+    state so numbering survives session reloads and branch-of-branch chains."""
+    branches = _list_branches(f"aar/session-{session_id}-branch-*", cwd=cwd)
     max_n = 0
     for b in branches:
-        suffix = b.rsplit("-fork-", 1)[-1]
+        suffix = b.rsplit("-branch-", 1)[-1]
         try:
             n = int(suffix)
             max_n = max(max_n, n)
@@ -170,7 +191,7 @@ class ShadowState:
     session_id: str
     original_branch: str = ""
     shadow_branch: str = ""
-    fork_counter: int = 0
+    branch_counter: int = 0
     turn_counter: int = 0
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     base_anchor: str = ""
@@ -187,12 +208,108 @@ class ShadowState:
 
 
 # ---------------------------------------------------------------------------
+# SessionStore.save hook — commit JSONL immediately after it is written
+# ---------------------------------------------------------------------------
+#
+# ``agent.core.loop`` fires ``session_end`` BEFORE the transport calls
+# ``store.save(session)``, so our ``session_end`` handler runs at a moment when
+# the JSONL file has not yet been written — the sweep finds nothing to commit
+# and the tree is left dirty the instant ``save`` returns.  The next
+# ``before_turn`` or slash-command does catch up, but if the user inspects the
+# repo (or a tool outside the extension touches it) between turns the tree
+# looks dirty for no good reason.
+#
+# To make "save" feel atomic from git's point of view we wrap
+# ``SessionStore.save`` once per process with a post-save hook that runs
+# ``_commit_pending`` after the original ``save`` completes. The hook only
+# fires when a ShadowState is registered for the matching ``session_id`` and
+# is ``enabled`` — so other processes / sessions are unaffected.
+
+
+# session_id -> live ShadowState, populated by register()/session_start.
+_active_states: dict[str, "ShadowState"] = {}
+# Guard so repeated register() calls (tests, reload) don't stack wrappers.
+_save_hook_installed = False
+
+
+def _commit_pending(label: str, logger: logging.Logger | None = None) -> bool:
+    """Module-level twin of the inner ``_auto_commit_pending`` closure — used
+    by the ``SessionStore.save`` hook, which has no event-loop ``ctx`` to pass.
+
+    Returns True iff an ``aar-meta: <label>`` commit was created.
+    """
+    log = logger or _module_logger
+    if not _has_changes():
+        return False
+    rc_add, out_add, err_add = _run_git("add", "-A")
+    if rc_add != 0:
+        detail = (err_add or out_add or "(no output)").strip()
+        log.warning("shadow-branching: git add -A failed during %s: %s", label, detail)
+        return False
+    rc_diff, _, _ = _run_git("diff", "--cached", "--quiet")
+    if rc_diff == 0:
+        return False
+    rc, out, err = _run_git("commit", "-m", f"aar-meta: {label}", "--no-verify")
+    if rc != 0:
+        detail = (out or err or "(no output)").strip()
+        log.warning("shadow-branching: auto-commit of pending changes failed: %s", detail)
+        return False
+    log.debug(
+        "shadow-branching: auto-committed pending changes (%s) → %s",
+        label,
+        _short_hash("HEAD"),
+    )
+    return True
+
+
+def _install_save_hook() -> None:
+    """Monkey-patch ``SessionStore.save`` so that every save is immediately
+    followed by an ``aar-meta: session-saved`` commit when shadow-branching is
+    active for the session being saved.
+
+    Idempotent: only installs once per process.  Safe to call at every
+    ``register()`` because the sentinel attribute ``_aar_shadow_wrapped`` on the
+    method object pins the installed state even across re-imports of this
+    module.
+    """
+    global _save_hook_installed
+    if _save_hook_installed:
+        return
+    try:
+        from agent.memory.session_store import SessionStore
+    except Exception as exc:  # pragma: no cover — aar must be importable
+        _module_logger.debug("shadow-branching: cannot import SessionStore: %s", exc)
+        return
+
+    if getattr(SessionStore.save, "_aar_shadow_wrapped", False):
+        _save_hook_installed = True
+        return
+
+    original_save = SessionStore.save
+
+    def save_with_shadow_commit(self: Any, session: Any) -> Any:
+        path = original_save(self, session)
+        state = _active_states.get(getattr(session, "session_id", ""))
+        if state is not None and state.enabled:
+            _commit_pending("session-saved", logger=_module_logger)
+        return path
+
+    save_with_shadow_commit._aar_shadow_wrapped = True  # type: ignore[attr-defined]
+    SessionStore.save = save_with_shadow_commit  # type: ignore[assignment]
+    _save_hook_installed = True
+
+
+# ---------------------------------------------------------------------------
 # Extension entry-point
 # ---------------------------------------------------------------------------
 
 
 def register(api: Any) -> None:
     """Register the shadow-branching extension against *api*."""
+
+    # Wrap SessionStore.save so that every save triggers an immediate commit.
+    # Idempotent: safe to call once per register() invocation.
+    _install_save_hook()
 
     state: ShadowState | None = None
 
@@ -209,6 +326,10 @@ def register(api: Any) -> None:
         meta = getattr(session, "metadata", None)
         if isinstance(meta, dict):
             meta["shadow_branching"] = state.to_metadata()
+        # Keep the module-level registry in sync so the SessionStore.save hook
+        # can find the right state to sweep when save(session_id=...) fires.
+        if state.session_id:
+            _active_states[state.session_id] = state
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
         """Count aar-auto commits on *branch* and build a checkpoint list."""
@@ -239,26 +360,52 @@ def register(api: Any) -> None:
         """Commit any uncommitted changes with an aar-meta message.
 
         This sweeps up session JSONL writes (and any other minor file changes that
-        haven't been captured by a checkpoint yet) so that commands like /fork,
+        haven't been captured by a checkpoint yet) so that commands like /branch,
         /switch, and /done don't get blocked by a dirty working tree caused purely
         by the session store being updated outside of git.
 
+        *ctx* may be ``None`` (e.g. when called from the SessionStore.save hook,
+        which runs outside any event dispatch); in that case the module logger
+        is used.
+
         Returns True if a commit was made, False if the tree was already clean or
-        the commit failed.
+        the commit failed.  On failure a warning is logged so callers can decide
+        whether to abort — silent ``False`` only means "nothing needed committing".
         """
+        logger = getattr(ctx, "logger", None) or _module_logger
         if not _has_changes():
             return False
-        _run_git("add", "-A")
-        rc, _, err = _run_git(
+        rc_add, out_add, err_add = _run_git("add", "-A")
+        if rc_add != 0:
+            # git add -A can fail for a number of reasons — most importantly here,
+            # it times out on large working trees (venv/, node_modules/).  Surface
+            # it loudly so the caller (/branch, /switch, /done) can refuse to
+            # silently proceed on a tree that still holds un-staged work.
+            detail = (err_add or out_add or "(no output)").strip()
+            logger.warning(
+                "shadow-branching: git add -A failed during %s: %s", label, detail
+            )
+            return False
+        # After staging, check whether anything actually made it into the index.
+        # git add -A can succeed yet stage nothing (e.g. all changes were to
+        # files outside the work-tree or the content was identical to HEAD).
+        rc_diff, _, _ = _run_git("diff", "--cached", "--quiet")
+        if rc_diff == 0:
+            # Index is clean — nothing to commit; silently skip.
+            return False
+        rc, out, err = _run_git(
             "commit",
             "-m",
             f"aar-meta: {label}",
             "--no-verify",
         )
         if rc != 0:
-            ctx.logger.warning("shadow-branching: auto-commit of pending changes failed: %s", err)
+            detail = (out or err or "(no output)").strip()
+            logger.warning(
+                "shadow-branching: auto-commit of pending changes failed: %s", detail
+            )
             return False
-        ctx.logger.debug(
+        logger.debug(
             "shadow-branching: auto-committed pending changes (%s) → %s",
             label,
             _short_hash("HEAD"),
@@ -342,14 +489,14 @@ def register(api: Any) -> None:
 
             base = _read_anchor_base(shadow_name, current or "main")
             turn, ckpts = _reconstruct_from_branch(shadow_name)
-            fork_counter = _next_fork_n(session_id) - 1  # already-used counter
+            branch_counter = _next_branch_n(session_id) - 1  # already-used counter
             state = ShadowState(
                 session_id=session_id,
                 original_branch=base,
                 shadow_branch=shadow_name,
                 turn_counter=turn,
                 checkpoints=ckpts,
-                fork_counter=max(0, fork_counter),
+                branch_counter=max(0, branch_counter),
                 base_anchor=_short_hash(shadow_name + "^{/^aar-init:}") or _short_hash("HEAD"),
             )
             ctx.logger.info(
@@ -407,6 +554,20 @@ def register(api: Any) -> None:
     # session_end — sweep up any dirty files left after agent.run() + store.save()
     # ------------------------------------------------------------------
 
+    @api.on("before_turn")
+    def on_before_turn(event: Any, ctx: Any) -> None:
+        """Sweep any pending changes before each new agent turn starts.
+
+        The transport writes the session JSONL after every completed turn (outside
+        the agent loop).  By the time the *next* turn's ``before_turn`` fires the
+        file is already on disk, so we commit it here with an ``aar-meta: turn sync``
+        message.  This keeps the working tree clean throughout the session so that
+        ``/branch``, ``/switch``, and ``/done`` are never blocked by a dirty tree
+        caused purely by session bookkeeping."""
+        if state is None or not state.enabled:
+            return
+        _auto_commit_pending(ctx, "turn sync")
+
     @api.on("session_end")
     def on_session_end(event: Any, ctx: Any) -> None:
         """Commit any files that were written after the last tool_result checkpoint.
@@ -415,7 +576,7 @@ def register(api: Any) -> None:
         (and therefore after every tool_result event). This means each completed
         turn leaves the JSONL dirty in git. We commit it here with an
         ``aar-meta: session sync`` message so the working tree stays clean and
-        commands like /fork and /switch never block on pending changes."""
+        commands like /branch and /switch never block on pending changes."""
         if state is None or not state.enabled:
             return
         _auto_commit_pending(ctx, "session sync")
@@ -445,15 +606,34 @@ def register(api: Any) -> None:
 
         prev_turn = state.turn_counter
         state.turn_counter += 1
-        _run_git("add", "-A")
-        rc, _, err = _run_git(
+        rc_add, out_add, err_add = _run_git("add", "-A")
+        if rc_add != 0:
+            # Most commonly a timeout on a huge working tree (venv/,
+            # node_modules/). Log loudly — a silently-skipped checkpoint means
+            # the user's next /branch or /undo will operate on stale state.
+            detail = (err_add or out_add or "(no output)").strip()
+            ctx.logger.warning(
+                "shadow-branching: git add -A failed for tool_result %s: %s — checkpoint skipped",
+                tool_name,
+                detail,
+            )
+            state.turn_counter = prev_turn
+            return
+        # Guard against "nothing to commit" after staging — can happen when the
+        # tool wrote a file whose content is identical to the tracked version.
+        rc_diff, _, _ = _run_git("diff", "--cached", "--quiet")
+        if rc_diff == 0:
+            state.turn_counter = prev_turn
+            return
+        rc, out, err = _run_git(
             "commit",
             "-m",
             f"aar-auto: {tool_name} turn-{state.turn_counter}",
             "--no-verify",
         )
         if rc != 0:
-            ctx.logger.warning("shadow-branching: checkpoint commit failed: %s", err)
+            detail = (out or err or "(no output)").strip()
+            ctx.logger.warning("shadow-branching: checkpoint commit failed: %s", detail)
             state.turn_counter = prev_turn
             return
 
@@ -531,14 +711,14 @@ def register(api: Any) -> None:
         return _do_undo(args, ctx)
 
     # ------------------------------------------------------------------
-    # /fork
+    # /branch
     # ------------------------------------------------------------------
 
     @api.command(
-        "fork",
-        description="Preserve current shadow as aar/session-<id>-fork-<K> and branch fresh (optionally from N back).",
+        "branch",
+        description="Preserve current shadow as aar/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
     )
-    def cmd_fork(args: str, ctx: Any) -> str | None:
+    def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
         if state is None or not state.enabled:
             ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
@@ -547,59 +727,84 @@ def register(api: Any) -> None:
         # Sweep up any session-store writes (JSONL etc.) that happened outside
         # of tool_result checkpoints so the working tree is clean before we
         # rename branches and create a new one.
-        _auto_commit_pending(ctx, "pre-fork sync")
+        _auto_commit_pending(ctx, "pre-branch sync")
+
+        # Refuse to branch on a still-dirty tree: if the sweep couldn't commit
+        # the pending work (e.g. ``git add -A`` timed out on a huge venv/),
+        # preserving the current shadow would freeze a branch that silently
+        # omits the user's actual work.  Better to stop and let the user
+        # resolve than to hand them an empty-looking "preserved" branch.
+        if _has_changes():
+            rc, status_out, _ = _run_git("status", "--porcelain")
+            preview = ""
+            if rc == 0 and status_out:
+                files = [ln[3:] for ln in status_out.splitlines() if len(ln) > 3][:5]
+                more = "" if len(status_out.splitlines()) <= 5 else " …"
+                preview = f" ({', '.join(files)}{more})"
+            ctx.logger.warning(
+                "shadow-branching: refusing to /branch — working tree is still dirty%s",
+                preview,
+            )
+            return (
+                "✗ working tree still dirty after pre-branch sync"
+                f"{preview} — commit manually or add noisy paths (venv/, "
+                "node_modules/, __pycache__/, .web_mcp_cache/) to .gitignore, "
+                "then retry /branch"
+            )
 
         n, _ = _parse_int_arg(args)
         if n is not None and n > len(state.checkpoints):
             ctx.logger.warning(
-                "shadow-branching: only %d checkpoints, cannot fork %d back",
+                "shadow-branching: only %d checkpoints, cannot branch %d back",
                 len(state.checkpoints),
                 n,
             )
-            return f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot fork {n} back"
+            return (
+                f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot branch {n} back"
+            )
 
-        # Resolve fork point before rename so HEAD~N is still valid.
-        fork_ref = f"HEAD~{n}" if n else "HEAD"
-        rc, fork_sha, err = _run_git("rev-parse", fork_ref)
+        # Resolve branch point before rename so HEAD~N is still valid.
+        branch_ref = f"HEAD~{n}" if n else "HEAD"
+        rc, branch_sha, err = _run_git("rev-parse", branch_ref)
         if rc != 0:
-            ctx.logger.warning("shadow-branching: cannot resolve fork point %s: %s", fork_ref, err)
-            return f"✗ cannot resolve fork point {fork_ref}: {err}"
+            ctx.logger.warning(
+                "shadow-branching: cannot resolve branch point %s: %s", branch_ref, err
+            )
+            return f"✗ cannot resolve branch point {branch_ref}: {err}"
 
-        fork_n = _next_fork_n(state.session_id)
-        preserved = f"{state.shadow_branch}-fork-{fork_n}"
+        branch_n = _next_branch_n(state.session_id)
+        preserved = f"{state.shadow_branch}-branch-{branch_n}"
 
         rc, _, err = _run_git("branch", "-m", state.shadow_branch, preserved)
         if rc != 0:
             ctx.logger.warning("shadow-branching: branch rename failed: %s", err)
             return f"✗ branch rename failed: {err}"
 
-        rc, _, err = _run_git("checkout", "-b", state.shadow_branch, fork_sha)
+        rc, _, err = _run_git("checkout", "-b", state.shadow_branch, branch_sha)
         if rc != 0:
             # Roll back the rename.
             _run_git("branch", "-m", preserved, state.shadow_branch)
             ctx.logger.warning(
                 "shadow-branching: cannot start new branch at %s: %s",
-                fork_sha[:8],
+                branch_sha[:8],
                 err,
             )
-            return f"✗ cannot start new branch at {fork_sha[:8]}: {err}"
+            return f"✗ cannot start new branch at {branch_sha[:8]}: {err}"
 
-        state.fork_counter = fork_n
+        state.branch_counter = branch_n
         if n:
             state.checkpoints = state.checkpoints[:-n]
             state.turn_counter = max(0, state.turn_counter - n)
 
         ctx.logger.info(
-            "[FORK preserved=%s active=%s forked-from=%s]",
+            "[BRANCH preserved=%s active=%s branched-from=%s]",
             preserved,
             state.shadow_branch,
-            fork_sha[:8],
+            branch_sha[:8],
         )
         _sync_metadata(ctx)
         suffix = f" (rewound {n} checkpoint(s))" if n else ""
-        return (
-            f"⑂ fork-{fork_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
-        )
+        return f"⑂ branch-{branch_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
 
     # ------------------------------------------------------------------
     # /switch
@@ -609,7 +814,7 @@ def register(api: Any) -> None:
         "switch",
         description=(
             "Switch to another aar/session-<id>* branch. "
-            "Shorthands: fork-<K> or bare <K> for a fork, "
+            "Shorthands: branch-<K> or bare <K> for a branch, "
             "'main'/'active'/'shadow' for the canonical shadow branch. "
             "No args: show current branch and available targets."
         ),
@@ -631,7 +836,7 @@ def register(api: Any) -> None:
             for b in branches:
                 marker = " ◀ active" if b == state.shadow_branch else ""
                 lines.append(f"  {b}{marker}")
-            lines.append("Usage: /switch <fork-K | K | main | full-branch-name>")
+            lines.append("Usage: /switch <branch-K | K | main | full-branch-name>")
             return "\n".join(lines)
 
         # Sweep up session-store writes before checking for a clean tree.
@@ -642,10 +847,10 @@ def register(api: Any) -> None:
         if target in {"main", "active", "shadow"}:
             target = canonical
 
-        # Numeric / fork-K / other shorthands → aar/session-<id>-fork-K
+        # Numeric / branch-K / other shorthands → aar/session-<id>-branch-K
         elif target.isdigit():
-            target = f"{canonical}-fork-{target}"
-        elif target.startswith("fork-"):
+            target = f"{canonical}-branch-{target}"
+        elif target.startswith("branch-"):
             target = f"{canonical}-{target}"
         elif not target.startswith("aar/session-"):
             target = f"{canonical}-{target}"
@@ -681,11 +886,13 @@ def register(api: Any) -> None:
         return f"⇄ switched to {target} (base={base}, {turn} checkpoint(s))"
 
     # ------------------------------------------------------------------
-    # /forks
+    # /branches
     # ------------------------------------------------------------------
 
-    @api.command("forks", description="List all shadow/fork branches for this session.")
-    def cmd_forks(args: str, ctx: Any) -> str | None:
+    @api.command(
+        "branches", description="List all shadow/branch copies for this session as a tree."
+    )
+    def cmd_branches(args: str, ctx: Any) -> str | None:
         if state is None:
             ctx.logger.info("shadow-branching: not initialised")
             return "✗ shadow-branching not initialised"
@@ -698,10 +905,16 @@ def register(api: Any) -> None:
             )
             return f"no branches found for session {state.session_id}"
 
-        lines: list[str] = []
-        for b in branches:
+        canonical = f"aar/session-{state.session_id}"
+        fork_prefix = f"{canonical}-branch-"
+        root_marker = " ◀ active" if state.shadow_branch == canonical else ""
+        lines: list[str] = [f"  {canonical}{root_marker}"]
+        ctx.logger.info("  * %s%s", canonical, " (active)" if root_marker else "")
+
+        children = sorted(b for b in branches if b.startswith(fork_prefix))
+        for b in children:
             marker = " ◀ active" if b == state.shadow_branch else ""
-            lines.append(f"  {b}{marker}")
+            lines.append(f"      {b}{marker}")
             ctx.logger.info("  * %s%s", b, " (active)" if marker else "")
         return "\n".join(lines)
 
@@ -740,14 +953,14 @@ def register(api: Any) -> None:
                 msg_parts.append(tok)
         message = " ".join(msg_parts).strip()
 
-        forks = _list_branches(f"aar/session-{state.session_id}-fork-*")
+        forks = _list_branches(f"aar/session-{state.session_id}-branch-*")
         if forks and "--yes" not in flags:
             ctx.logger.info(
-                "shadow-branching: fork branches still exist (%s). "
-                "Pass --yes to squash only the active shadow and leave forks intact.",
+                "shadow-branching: preserved branches still exist (%s). "
+                "Pass --yes to squash only the active shadow and leave them intact.",
                 ", ".join(forks),
             )
-            return f"⚠ fork branches still exist: {', '.join(forks)} — pass --yes to proceed"
+            return f"⚠ preserved branches still exist: {', '.join(forks)} — pass --yes to proceed"
 
         base = _read_anchor_base(state.shadow_branch, state.original_branch or "main")
 
@@ -804,7 +1017,7 @@ def register(api: Any) -> None:
         "The shadow-branching extension is active. Every session runs on an isolated "
         "aar/session-<id> git branch; modifying tool calls auto-checkpoint as "
         "'aar-auto: <tool> turn-<N>'. "
-        "Available slash commands: /undo [N] [--force], /revert, /fork [N], "
-        "/switch <branch|fork-K>, /forks, /done. "
+        "Available slash commands: /undo [N] [--force], /revert, /branch [N], "
+        "/switch <branch|branch-K>, /branches, /done. "
         "Never commit directly to the user's base branch — work is merged back only on /done."
     )
