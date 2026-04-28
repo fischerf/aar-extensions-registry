@@ -45,6 +45,13 @@ purely by session bookkeeping.
 
 All state is also mirrored into ``session.metadata['shadow_branching']`` so the
 session JSONL store keeps a faithful record across resumes.
+
+**Cross-session safety:** if the working directory is left on a shadow branch
+from a *previous* session (e.g. the user ran ``aar chat`` without ``--session``),
+``session_start`` automatically checks out the recorded base branch before
+creating the new shadow branch.  ``/switch`` is scoped to branches of the
+*current* session only — switching to another session's shadow branch is
+rejected with a descriptive message.
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["register", "ShadowState"]
+__all__ = ["register", "ShadowState", "reload_session_from_disk"]
 
 _module_logger = logging.getLogger("aar_ext_shadow_branching")
 
@@ -300,6 +307,79 @@ def _install_save_hook() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session reload helper — used by /switch to sync conversation history
+# ---------------------------------------------------------------------------
+
+
+def reload_session_from_disk(session: Any, logger: logging.Logger | None = None) -> bool:
+    """Reload the session's events (and metadata) from its JSONL file on disk.
+
+    After ``git checkout <branch>`` the JSONL file on disk reflects the target
+    branch's conversation history.  This function re-reads it and **replaces**
+    the live ``Session`` object's events, step_count, and metadata in-place so
+    that the LLM sees a conversation that matches the files on disk.
+
+    Returns True if the reload succeeded, False on any error (the session is
+    left untouched in that case).
+    """
+    log = logger or _module_logger
+    try:
+        from agent.memory.session_store import SessionStore
+    except Exception as exc:
+        log.warning("shadow-branching: cannot import SessionStore for reload: %s", exc)
+        return False
+
+    session_id = getattr(session, "session_id", None)
+    if not session_id:
+        log.warning("shadow-branching: session has no session_id — cannot reload")
+        return False
+
+    store = SessionStore()
+    try:
+        reloaded = store.load(session_id)
+    except FileNotFoundError:
+        log.info(
+            "shadow-branching: no JSONL file for session %s on this branch — "
+            "clearing conversation history",
+            session_id,
+        )
+        # The target branch may predate the session store (e.g. an early fork
+        # that was created before any JSONL was written).  Clear events so the
+        # LLM doesn't hallucinate from a stale conversation.
+        if hasattr(session, "events"):
+            session.events.clear()
+        if hasattr(session, "step_count"):
+            session.step_count = 0
+        return True
+    except Exception as exc:
+        log.warning("shadow-branching: failed to reload session JSONL: %s", exc)
+        return False
+
+    # Replace in-place so every reference (ExtensionContext, transport, etc.)
+    # sees the updated state without needing a replace_session() API.
+    if hasattr(session, "events"):
+        session.events.clear()
+        session.events.extend(reloaded.events)
+    if hasattr(session, "step_count"):
+        session.step_count = reloaded.step_count
+    # Preserve shadow_branching metadata (we'll overwrite it via _sync_metadata
+    # right after), but pull in everything else from the reloaded session.
+    if hasattr(session, "metadata") and isinstance(session.metadata, dict):
+        shadow_meta = session.metadata.get("shadow_branching")
+        session.metadata.update(reloaded.metadata)
+        if shadow_meta is not None:
+            session.metadata["shadow_branching"] = shadow_meta
+
+    log.info(
+        "shadow-branching: reloaded session %s from disk (%d events, step_count=%d)",
+        session_id,
+        len(session.events),
+        session.step_count,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Extension entry-point
 # ---------------------------------------------------------------------------
 
@@ -382,9 +462,7 @@ def register(api: Any) -> None:
             # it loudly so the caller (/branch, /switch, /done) can refuse to
             # silently proceed on a tree that still holds un-staged work.
             detail = (err_add or out_add or "(no output)").strip()
-            logger.warning(
-                "shadow-branching: git add -A failed during %s: %s", label, detail
-            )
+            logger.warning("shadow-branching: git add -A failed during %s: %s", label, detail)
             return False
         # After staging, check whether anything actually made it into the index.
         # git add -A can succeed yet stage nothing (e.g. all changes were to
@@ -401,9 +479,7 @@ def register(api: Any) -> None:
         )
         if rc != 0:
             detail = (out or err or "(no output)").strip()
-            logger.warning(
-                "shadow-branching: auto-commit of pending changes failed: %s", detail
-            )
+            logger.warning("shadow-branching: auto-commit of pending changes failed: %s", detail)
             return False
         logger.debug(
             "shadow-branching: auto-committed pending changes (%s) → %s",
@@ -436,6 +512,17 @@ def register(api: Any) -> None:
 
         session_id = getattr(getattr(ctx, "session", None), "session_id", None) or "unknown"
 
+        # ── Skip re-initialisation when already active ────────────────
+        # ``run_loop`` fires ``session_start`` on *every* call — i.e. once
+        # per user message in chat mode.  If we already have a live, enabled
+        # ``state`` for this session we must not re-run the full init path
+        # because that would ``git checkout`` the canonical shadow branch and
+        # silently undo any ``/switch`` the user did between turns.
+        # A lightweight metadata sync is enough to keep things in order.
+        if state is not None and state.enabled and state.session_id == session_id:
+            _sync_metadata(ctx)
+            return
+
         if not _is_git_repo():
             # Non-repo fallback
             try:
@@ -466,6 +553,33 @@ def register(api: Any) -> None:
             _run_git("commit", "--allow-empty", "-m", "Initial commit")
 
         current = _current_branch()
+
+        # ── Guard: repo left on a shadow branch from a *different* session ──
+        # If someone opens a fresh session in a directory whose HEAD is still
+        # on aar/session-<OTHER>, branching from there would root the new
+        # session's work on top of the old session's WIP — mixing file state
+        # from session A with conversation history from session B.
+        # Fix: switch to the old shadow branch's recorded base first.
+        if current and current.startswith("aar/session-") and session_id not in current:
+            old_base = _read_anchor_base(current, "main")
+            ctx.logger.warning(
+                "shadow-branching: repo is on %s (shadow branch of another session). "
+                "Switching to base branch %r to avoid cross-session inconsistency. "
+                "Hint: resume the prior session with --session to keep working on it.",
+                current,
+                old_base,
+            )
+            rc_sw, _, err_sw = _run_git("checkout", old_base)
+            if rc_sw != 0:
+                ctx.logger.warning(
+                    "shadow-branching: cannot switch to base %s: %s — "
+                    "creating shadow branch from current HEAD anyway",
+                    old_base,
+                    err_sw,
+                )
+            else:
+                current = old_base
+
         shadow_name = f"aar/session-{session_id}"
 
         # Reconnaissance: list prior session branches (informational).
@@ -802,6 +916,28 @@ def register(api: Any) -> None:
             state.shadow_branch,
             branch_sha[:8],
         )
+
+        # ── Reload session events to match the fork point ─────────────
+        # The new branch's HEAD points at the fork commit whose JSONL
+        # reflects the conversation *up to* that point.  Without reloading,
+        # Session.events still contains the full history from the preserved
+        # branch, so the next store.save() would overwrite the fork-point
+        # JSONL with stale events — and the LLM would see conversation
+        # about work that now lives only on the preserved branch.
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            reloaded = reload_session_from_disk(session, logger=ctx.logger)
+            if reloaded:
+                ctx.logger.info(
+                    "shadow-branching: session events reloaded for new branch (%d events)",
+                    len(session.events),
+                )
+            else:
+                ctx.logger.warning(
+                    "shadow-branching: could not reload session events after /branch — "
+                    "conversation history may include events from the preserved branch"
+                )
+
         _sync_metadata(ctx)
         suffix = f" (rewound {n} checkpoint(s))" if n else ""
         return f"⑂ branch-{branch_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
@@ -855,6 +991,17 @@ def register(api: Any) -> None:
         elif not target.startswith("aar/session-"):
             target = f"{canonical}-{target}"
 
+        # ── Guard: never switch to a branch belonging to a different session ──
+        if target.startswith("aar/session-") and state.session_id not in target:
+            ctx.logger.warning(
+                "shadow-branching: refusing to switch to %s — it belongs to a different session. "
+                "Start a new aar session (or use --session) to work on that branch's session.",
+                target,
+            )
+            return (
+                f"✗ {target} belongs to a different session — start a new aar session to work on it"
+            )
+
         if not _branch_exists(target):
             ctx.logger.warning("shadow-branching: branch %r does not exist", target)
             return f"✗ branch {target!r} does not exist"
@@ -876,6 +1023,27 @@ def register(api: Any) -> None:
         state.original_branch = base
         state.turn_counter = turn
         state.checkpoints = ckpts
+
+        # ── Reload session events from the target branch's JSONL ──────
+        # After git checkout the JSONL on disk reflects the target branch's
+        # conversation.  Without reloading, the LLM would see chat history
+        # from the *previous* branch while files on disk belong to the new
+        # one — a guaranteed hallucination factory.
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            reloaded = reload_session_from_disk(session, logger=ctx.logger)
+            if reloaded:
+                ctx.logger.info(
+                    "shadow-branching: session events reloaded for branch %s (%d events)",
+                    target,
+                    len(session.events),
+                )
+            else:
+                ctx.logger.warning(
+                    "shadow-branching: could not reload session events — "
+                    "conversation history may not match files on disk"
+                )
+
         ctx.logger.info(
             "shadow-branching: switched to %s (base=%s, %d checkpoint(s))",
             target,
@@ -883,7 +1051,8 @@ def register(api: Any) -> None:
             turn,
         )
         _sync_metadata(ctx)
-        return f"⇄ switched to {target} (base={base}, {turn} checkpoint(s))"
+        events_info = f", {len(session.events)} events" if session is not None else ""
+        return f"⇄ switched to {target} (base={base}, {turn} checkpoint(s){events_info})"
 
     # ------------------------------------------------------------------
     # /branches
@@ -1019,5 +1188,7 @@ def register(api: Any) -> None:
         "'aar-auto: <tool> turn-<N>'. "
         "Available slash commands: /undo [N] [--force], /revert, /branch [N], "
         "/switch <branch|branch-K>, /branches, /done. "
+        "/switch only works within the current session's branches — to resume "
+        "another session's work, restart aar with --session <id>. "
         "Never commit directly to the user's base branch — work is merged back only on /done."
     )

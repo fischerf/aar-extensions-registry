@@ -63,6 +63,8 @@ class FakeSession:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.metadata: dict[str, Any] = {}
+        self.events: list[Any] = []
+        self.step_count: int = 0
 
 
 class FakeCtx:
@@ -432,9 +434,7 @@ def test_branch_auto_commits_pending(session_api, caplog: pytest.LogCaptureFixtu
     )
 
 
-def test_session_store_save_commits_pending_jsonl(
-    session_api, tmp_path: Path
-) -> None:
+def test_session_store_save_commits_pending_jsonl(session_api, tmp_path: Path) -> None:
     """After ``SessionStore.save()`` writes the session JSONL, the extension
     should immediately commit the file so the tree is never left dirty between
     turns.
@@ -482,9 +482,7 @@ def test_session_store_save_commits_pending_jsonl(
     )
 
 
-def test_session_store_save_noop_when_session_unknown(
-    session_api, tmp_path: Path
-) -> None:
+def test_session_store_save_noop_when_session_unknown(session_api, tmp_path: Path) -> None:
     """The save hook must not commit on behalf of sessions that aren't ours.
 
     A SessionStore save for a session_id that shadow-branching doesn't know
@@ -563,9 +561,9 @@ def test_branch_refuses_when_pre_sync_fails(
     assert result.startswith("✗"), f"expected refusal, got: {result!r}"
     assert "working tree" in result.lower()
     # The `git add -A` failure itself must be logged so the user can act on it.
-    assert any(
-        "git add -A failed" in rec.getMessage() for rec in caplog.records
-    ), "expected explicit warning about git add -A failure"
+    assert any("git add -A failed" in rec.getMessage() for rec in caplog.records), (
+        "expected explicit warning about git add -A failure"
+    )
     # And no preserved branch must have been created with the wrong content.
     branches = set(_list_branches("aar/session-*", cwd=repo))
     assert "aar/session-s1-branch-1" not in branches, (
@@ -1157,6 +1155,385 @@ def test_session_start_leaves_other_sessions_untouched(repo: Path) -> None:
     branches = set(_list_branches("aar/session-*", cwd=repo))
     assert "aar/session-zzzold" in branches
     assert "aar/session-fresh1" in branches
+
+
+# ---------------------------------------------------------------------------
+# Cross-session safety guards
+# ---------------------------------------------------------------------------
+
+
+def test_session_start_rebases_to_base_when_on_stale_shadow_branch(repo: Path) -> None:
+    """Starting a fresh session while HEAD is on another session's shadow branch
+    should auto-checkout the old branch's base (main) before creating the new
+    shadow branch — preventing cross-session file/conversation inconsistency."""
+    # Session A: create a shadow branch with some work
+    api_a = FakeAPI()
+    register(api_a)
+    ctx_a = FakeCtx(FakeSession("old_session"))
+    api_a.handlers["session_start"][0](None, ctx_a)
+
+    (repo / "from_old.txt").write_text("old session work", encoding="utf-8")
+    _fire_tool_result(api_a, ctx_a, tool_name="write_file")
+
+    # Confirm HEAD is on the old shadow branch
+    branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
+    assert branch_out == "aar/session-old_session"
+
+    # Session B: start a NEW session — repo is still on old_session's branch
+    api_b = FakeAPI()
+    register(api_b)
+    ctx_b = FakeCtx(FakeSession("new_session"))
+    api_b.handlers["session_start"][0](None, ctx_b)
+
+    st = _session_state(ctx_b)
+    assert st["enabled"] is True
+    assert st["shadow_branch"] == "aar/session-new_session"
+    # The new shadow must be rooted on main, NOT on the old shadow branch
+    assert st["original_branch"] == "main"
+
+    # The aar-init anchor must record base=main
+    log = _git("log", "--oneline", "--grep=aar-init:", "aar/session-new_session", cwd=repo)
+    assert "base=main" in log.stdout
+
+
+def test_session_start_stale_shadow_warning_logged(
+    repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When rebasing away from a stale shadow branch a warning must be logged."""
+    # Create old session's shadow branch
+    _git("checkout", "-b", "aar/session-stale1", cwd=repo)
+    _git("commit", "--allow-empty", "-m", "aar-init: base=main", "--no-verify", cwd=repo)
+
+    # Start new session while on stale branch
+    api = FakeAPI()
+    register(api)
+    ctx = FakeCtx(FakeSession("fresh2"))
+    with caplog.at_level(logging.WARNING):
+        api.handlers["session_start"][0](None, ctx)
+
+    assert any("shadow branch of another session" in r.message for r in caplog.records)
+    assert any("--session" in r.message for r in caplog.records)
+
+
+def test_switch_rejects_cross_session_branch(repo: Path) -> None:
+    """/switch must refuse to check out a branch belonging to a different session."""
+    # Session A
+    api_a = FakeAPI()
+    register(api_a)
+    ctx_a = FakeCtx(FakeSession("sess_a"))
+    api_a.handlers["session_start"][0](None, ctx_a)
+
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _fire_tool_result(api_a, ctx_a, tool_name="write_file")
+
+    # Go back to main so session B doesn't trigger the stale-branch guard
+    _git("checkout", "main", cwd=repo)
+
+    # Session B
+    api_b = FakeAPI()
+    register(api_b)
+    ctx_b = FakeCtx(FakeSession("sess_b"))
+    api_b.handlers["session_start"][0](None, ctx_b)
+
+    # Try to /switch to session A's branch — must be rejected
+    result = _run_cmd(api_b, "switch", "aar/session-sess_a", ctx_b)
+    assert result is not None
+    assert "different session" in result
+    assert "✗" in result
+
+    # Confirm we're still on session B's branch
+    branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
+    assert branch_out == "aar/session-sess_b"
+
+
+def test_switch_allows_own_session_branches(repo: Path) -> None:
+    """/switch must still allow switching between branches of the same session."""
+    api, ctx, _ = FakeAPI(), None, repo
+
+    api = FakeAPI()
+    register(api)
+    ctx = FakeCtx(FakeSession("mine"))
+    api.handlers["session_start"][0](None, ctx)
+
+    # Create some work and branch
+    (repo / "x.txt").write_text("x", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+    result = _run_cmd(api, "branch", "", ctx)
+    assert result is not None and "branch-1" in result
+
+    # /switch back to branch-1
+    result = _run_cmd(api, "switch", "1", ctx)
+    assert result is not None
+    assert "switched to" in result.lower() or "⇄" in result
+
+    # /switch back to main shadow
+    result = _run_cmd(api, "switch", "main", ctx)
+    assert result is not None
+    assert "⇄" in result
+
+
+def test_switch_survives_subsequent_session_start(repo: Path) -> None:
+    """/switch must not be undone by the next run_loop's session_start.
+
+    In chat mode, ``run_loop`` fires ``session_start`` on every user message.
+    Before the fix, ``on_start`` would unconditionally ``git checkout`` the
+    canonical shadow branch, silently reverting any ``/switch`` the user did
+    between turns.  This test reproduces that exact scenario."""
+    api = FakeAPI()
+    register(api)
+    session = FakeSession("surv")
+    ctx = FakeCtx(session)
+    api.handlers["session_start"][0](None, ctx)
+
+    # Create work + branch
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+    result = _run_cmd(api, "branch", "", ctx)
+    assert result is not None and "branch-1" in result
+
+    # More work on fresh shadow
+    (repo / "b.txt").write_text("b", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    # /switch to branch-1
+    result = _run_cmd(api, "switch", "1", ctx)
+    assert result is not None and "⇄" in result
+    st = _session_state(ctx)
+    assert st["shadow_branch"] == "aar/session-surv-branch-1"
+
+    # Confirm git HEAD is on branch-1
+    branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
+    assert branch_out == "aar/session-surv-branch-1"
+
+    # Simulate the next run_loop call — fires session_start again
+    api.handlers["session_start"][0](None, ctx)
+
+    # State must still reflect branch-1, NOT the canonical shadow
+    st2 = _session_state(ctx)
+    assert st2["shadow_branch"] == "aar/session-surv-branch-1", (
+        f"session_start re-initialised and switched back to {st2['shadow_branch']}"
+    )
+
+    # git HEAD must still be on branch-1
+    branch_out2 = _git("branch", "--show-current", cwd=repo).stdout.strip()
+    assert branch_out2 == "aar/session-surv-branch-1", (
+        f"session_start checked out {branch_out2} instead of staying on branch-1"
+    )
+
+    # File state must still match branch-1 (a.txt yes, b.txt no)
+    assert (repo / "a.txt").exists()
+    assert not (repo / "b.txt").exists()
+
+
+def test_branch_reloads_session_events_to_fork_point(repo: Path) -> None:
+    """/branch must reload session events from the fork point's JSONL so the
+    in-memory session no longer contains conversation about work that now lives
+    only on the preserved branch."""
+    from agent.core.events import AssistantMessage, UserMessage
+    from agent.core.session import Session as RealSession
+    from agent.memory.session_store import SessionStore
+
+    store = SessionStore(base_dir=repo / ".agent" / "sessions")
+
+    api = FakeAPI()
+    register(api)
+    session = FakeSession("br_reload")
+    ctx = FakeCtx(session)
+    api.handlers["session_start"][0](None, ctx)
+
+    # Turn 1: create a file + checkpoint
+    (repo / "first.txt").write_text("one", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    # Simulate conversation events and save the session JSONL
+    ctx.session.events = [
+        UserMessage(content="create first.txt"),
+        AssistantMessage(content="Done, created first.txt"),
+    ]
+    real_session = RealSession(
+        session_id="br_reload",
+        events=ctx.session.events,
+        step_count=1,
+        metadata=ctx.session.metadata,
+    )
+    store.save(real_session)
+    _fire_before_turn(api, ctx)  # commit the JSONL
+
+    # Turn 2: more work + more conversation
+    (repo / "second.txt").write_text("two", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    ctx.session.events = [
+        UserMessage(content="create first.txt"),
+        AssistantMessage(content="Done, created first.txt"),
+        UserMessage(content="now create second.txt"),
+        AssistantMessage(content="Done, created second.txt"),
+    ]
+    real_session2 = RealSession(
+        session_id="br_reload",
+        events=ctx.session.events,
+        step_count=2,
+        metadata=ctx.session.metadata,
+    )
+    store.save(real_session2)
+    _fire_before_turn(api, ctx)  # commit the JSONL
+
+    # Sanity: 4 events in memory, both files on disk
+    assert len(ctx.session.events) == 4
+    assert (repo / "second.txt").exists()
+
+    # /branch — preserves current state as branch-1, starts fresh from HEAD
+    result = _run_cmd(api, "branch", "", ctx)
+    assert result is not None and "branch-1" in result
+
+    # After /branch, the session events must reflect the fork point's JSONL
+    # (4 events — same as HEAD since we branched from HEAD with no rewind).
+    # The key property: the events match what's on disk for the new branch.
+    assert len(ctx.session.events) == 4
+
+    # Now test /branch N (rewind): go back to turn-1
+    # First do another piece of work so we have something to rewind
+    (repo / "third.txt").write_text("three", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+    ctx.session.events.append(UserMessage(content="create third.txt"))
+    ctx.session.events.append(AssistantMessage(content="Done, created third.txt"))
+    real_session3 = RealSession(
+        session_id="br_reload",
+        events=list(ctx.session.events),
+        step_count=3,
+        metadata=ctx.session.metadata,
+    )
+    store.save(real_session3)
+    _fire_before_turn(api, ctx)
+
+    assert len(ctx.session.events) == 6
+
+    # /branch 1 — rewind 1 checkpoint, preserving current as branch-2
+    result = _run_cmd(api, "branch", "1", ctx)
+    assert result is not None and "branch-2" in result
+
+    # After rewinding 1 checkpoint the JSONL on disk corresponds to the
+    # commit before the third.txt checkpoint.  The session events must be
+    # reloaded from that JSONL — so we should have fewer events than the 6
+    # we had before branching.  The exact count depends on which commit the
+    # branch-point JSONL was saved at; the important invariant is that the
+    # events about "third.txt" are gone.
+    assert len(ctx.session.events) < 6, (
+        f"expected events to shrink after /branch 1, got {len(ctx.session.events)}"
+    )
+    contents = " ".join(getattr(e, "content", "") or "" for e in ctx.session.events)
+    assert "third" not in contents.lower(), (
+        "session events should not mention third.txt after rewinding past it"
+    )
+
+
+def test_switch_reloads_session_events_from_target_branch(repo: Path) -> None:
+    """/switch must reload the session's conversation history from the target
+    branch's JSONL so the LLM sees events matching the files on disk."""
+    from agent.memory.session_store import SessionStore
+
+    store = SessionStore(base_dir=repo / ".agent" / "sessions")
+
+    api = FakeAPI()
+    register(api)
+    session = FakeSession("sw_reload")
+    ctx = FakeCtx(session)
+    api.handlers["session_start"][0](None, ctx)
+
+    # Turn 1: write a file + simulate a session save (creates JSONL on branch)
+    (repo / "first.txt").write_text("hello", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    # Fake some conversation events on the session object so the JSONL has content
+    from agent.core.events import AssistantMessage, UserMessage
+
+    ctx.session.events = [
+        UserMessage(content="create first.txt"),
+        AssistantMessage(content="Done, created first.txt"),
+    ]
+    # Manually save the session so the JSONL is written and committed
+    from agent.core.session import Session as RealSession
+
+    real_session = RealSession(
+        session_id="sw_reload",
+        events=ctx.session.events,
+        step_count=1,
+        metadata=ctx.session.metadata,
+    )
+    store.save(real_session)
+    # Let the save hook commit it
+    _fire_before_turn(api, ctx)
+
+    # /branch to preserve this state
+    result = _run_cmd(api, "branch", "", ctx)
+    assert result is not None and "branch-1" in result
+
+    # Turn 2 on the new branch: different work + different conversation
+    (repo / "second.txt").write_text("world", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    ctx.session.events = [
+        UserMessage(content="create first.txt"),
+        AssistantMessage(content="Done, created first.txt"),
+        UserMessage(content="now create second.txt"),
+        AssistantMessage(content="Done, created second.txt"),
+    ]
+    real_session2 = RealSession(
+        session_id="sw_reload",
+        events=ctx.session.events,
+        step_count=2,
+        metadata=ctx.session.metadata,
+    )
+    store.save(real_session2)
+    _fire_before_turn(api, ctx)
+
+    # Sanity: we have 4 events and second.txt exists
+    assert len(ctx.session.events) == 4
+    assert (repo / "second.txt").exists()
+
+    # /switch to branch-1 — should reload events from that branch's JSONL
+    result = _run_cmd(api, "switch", "1", ctx)
+    assert result is not None and "⇄" in result
+
+    # Files must match branch-1 (first.txt yes, second.txt no)
+    assert (repo / "first.txt").exists()
+    assert not (repo / "second.txt").exists()
+
+    # Session events must have been reloaded — should be the 2 events from branch-1
+    assert len(ctx.session.events) == 2
+    assert ctx.session.events[0].content == "create first.txt"
+    assert ctx.session.step_count == 1
+
+
+def test_switch_reload_missing_jsonl_clears_events(repo: Path) -> None:
+    """/switch to a branch that has no JSONL should clear session events
+    rather than leaving stale history from the previous branch."""
+    api = FakeAPI()
+    register(api)
+    session = FakeSession("sw_nojsonl")
+    ctx = FakeCtx(session)
+    api.handlers["session_start"][0](None, ctx)
+
+    # Create some work + checkpoint
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _fire_tool_result(api, ctx, tool_name="write_file")
+
+    # Put some events on the live session
+    from agent.core.events import UserMessage
+
+    ctx.session.events = [UserMessage(content="hello")]
+
+    # /branch preserves current state
+    result = _run_cmd(api, "branch", "", ctx)
+    assert result is not None and "branch-1" in result
+
+    # On the new (fresh) branch there's no JSONL yet
+    # /switch back to branch-1 which also has no JSONL saved by SessionStore
+    result = _run_cmd(api, "switch", "1", ctx)
+    assert result is not None and "⇄" in result
+
+    # Events should be cleared since there's no JSONL to load
+    assert len(ctx.session.events) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,14 @@ point, and every command is registered through the Slash-commands extension
 surface so it is available in every transport (CLI chat, inline TUI, fixed
 TUI, and ACP-surfaced clients such as the Zed editor).
 
+**Cross-session safety:** if the working directory is left on a shadow branch
+from a *previous* session (e.g. the user ran `aar chat` without `--session`),
+`session_start` automatically checks out the recorded base branch before
+creating a new shadow branch — preventing the new session from inheriting
+stale file state. `/switch` is scoped to branches of the *current* session
+only; attempting to switch to another session's branch is rejected with a
+descriptive message.
+
 ---
 
 ## Features
@@ -33,6 +41,21 @@ TUI, and ACP-surfaced clients such as the Zed editor).
   transport after all extension events fire). These commits use
   `aar-meta: session sync` and do not increment the turn counter or appear
   in the checkpoint list.
+* **Session reload on `/switch` and `/branch`.** When switching between branches
+  or creating a new branch, the extension reloads the session's conversation
+  history (events, step count, metadata) from the JSONL file on disk. After
+  `/branch`, the new branch's HEAD points at the fork commit whose JSONL
+  reflects only the conversation up to that point — without reloading, the
+  in-memory session would still contain events about work that now lives
+  exclusively on the preserved branch, causing the next `store.save()` to
+  overwrite the fork-point JSONL with stale history. After `/switch`, the
+  target branch's JSONL is loaded for the same reason. If the target branch
+  has no JSONL (e.g. an early fork before any session save), events are
+  cleared to avoid stale history. This keeps the LLM's context in sync with
+  the files — true time-travel within a session.
+* **Cross-session safety.** Starting a new session while the repo HEAD sits on
+  another session's shadow branch automatically checks out the recorded base
+  branch first. `/switch` rejects targets belonging to a different session.
 * Branch-aware: `/branch` preserves the current branch as
   `aar/session-<id>-branch-<K>` and starts a fresh shadow — branch numbering
   is derived from the branches on disk, so it survives session resumes and
@@ -57,8 +80,8 @@ TUI, and ACP-surfaced clients such as the Zed editor).
 |---|---|
 | `/undo [N] [--force]` | Revert N checkpoints (default 1). Refuses to run with a dirty tree unless `--force` is passed. Returns `↩ reverted N checkpoint(s) → <sha>`. |
 | `/revert [N] [--force]` | Alias for `/undo`. |
-| `/branch [N]` | Preserve active shadow as `aar/session-<id>-branch-<K>` and start a fresh branch from `HEAD~N` (or `HEAD` if N is omitted). Multiple branches are allowed. Returns `⑂ branch-K preserved as <branch> — now on fresh <branch>`. |
-| `/switch [<target>]` | Switch to any shadow/branch copy for this session. See **Switch shorthands** below. Returns `⇄ switched to <branch> (base=<base>, N checkpoint(s))`. |
+| `/branch [N]` | Preserve active shadow as `aar/session-<id>-branch-<K>` and start a fresh branch from `HEAD~N` (or `HEAD` if N is omitted). Reloads session events from the fork point's JSONL so the LLM context matches the new branch. Multiple branches are allowed. Returns `⑂ branch-K preserved as <branch> — now on fresh <branch>`. |
+| `/switch [<target>]` | Switch to any shadow/branch copy for **this** session. Reloads the session's conversation history from the target branch's JSONL so the LLM context matches the files on disk. Rejects branches belonging to other sessions. See **Switch shorthands** below. Returns `⇄ switched to <branch> (base=<base>, N checkpoint(s), M events)`. |
 | `/branches` | List every shadow/branch copy for this session as a tree, with the active branch marked `◀ active`. The canonical shadow is shown as the root; preserved copies are indented beneath it. |
 | `/done [message] [--yes]` | Squash-merge the active shadow back into the base branch recorded in the `aar-init` anchor. If preserved branches still exist it refuses unless `--yes` is passed. Conflicts abort the merge and print the conflicting paths. Returns `✓ squashed <shadow> → <base> as <sha>`. |
 
@@ -82,6 +105,11 @@ Error and warning returns use `✗` and `⚠` prefixes respectively.
 
 Use `main` / `active` / `shadow` to return to the canonical shadow branch
 after visiting a preserved branch.
+
+> **Note:** `/switch` only works within the current session's branches.
+> Passing a branch name that belongs to a different session (e.g.
+> `aar/session-OTHER-branch-1`) returns an error. To resume another session's
+> work, restart Aar with `--session <id>`.
 
 ---
 
@@ -120,6 +148,17 @@ group — no configuration changes needed.
 
 * The extension operates on the working directory. Use Aar's default project
   sandbox or run from your repo root.
+* **Session events are reloaded after `/branch` and `/switch`.** The in-memory
+  `Session.events` are replaced with the events from the on-disk JSONL so the
+  LLM never sees conversation history that doesn't match the files. After
+  `/branch`, the fork-point JSONL is loaded; after `/switch`, the target
+  branch's JSONL is loaded. If no JSONL exists on the target branch, events
+  are cleared.
+* **Starting a new session in a shadow-branching project:** if the repo HEAD
+  is on `aar/session-<OLD>` when a new session starts, the extension switches
+  to the old branch's recorded base (typically `main`) first. A warning is
+  logged with a hint to use `--session` to resume instead. This prevents the
+  new session from being rooted on the old session's work-in-progress.
 * `/done` does not delete the shadow or preserved branches — cleanup is left to
   the user (`git branch -D aar/session-<id>*`) so nothing is lost silently.
 * If `git user.name` / `user.email` are not configured, checkpoints are
