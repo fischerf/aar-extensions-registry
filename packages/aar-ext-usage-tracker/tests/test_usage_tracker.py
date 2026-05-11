@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from aar_ext_usage_tracker.tracker import (
+from aar_ext_usage_tracker import (
     MonthlyUsage,
     ProviderUsage,
     Quota,
@@ -363,7 +363,7 @@ def test_session_start_seeds_quota(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     # Patch the tracker's default path
     monkeypatch.setattr(
-        "aar_ext_usage_tracker.tracker._DEFAULT_PATH",
+        "aar_ext_usage_tracker._DEFAULT_PATH",
         tmp_path / "usage.json",
     )
 
@@ -382,7 +382,7 @@ def test_after_turn_records_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     from aar_ext_usage_tracker import register
 
     monkeypatch.setattr(
-        "aar_ext_usage_tracker.tracker._DEFAULT_PATH",
+        "aar_ext_usage_tracker._DEFAULT_PATH",
         tmp_path / "usage.json",
     )
 
@@ -409,7 +409,7 @@ def test_after_turn_computes_deltas(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     from aar_ext_usage_tracker import register
 
     monkeypatch.setattr(
-        "aar_ext_usage_tracker.tracker._DEFAULT_PATH",
+        "aar_ext_usage_tracker._DEFAULT_PATH",
         tmp_path / "usage.json",
     )
 
@@ -441,7 +441,7 @@ def test_usage_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from aar_ext_usage_tracker import register
 
     monkeypatch.setattr(
-        "aar_ext_usage_tracker.tracker._DEFAULT_PATH",
+        "aar_ext_usage_tracker._DEFAULT_PATH",
         tmp_path / "usage.json",
     )
 
