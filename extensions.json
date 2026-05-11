@@ -9,8 +9,8 @@
       "description": "Confirm before dangerous bash commands (rm -rf, sudo, etc.)",
       "tags": ["safety"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "protected-paths",
@@ -18,8 +18,8 @@
       "description": "Block writes to .env, secrets files, and sensitive paths",
       "tags": ["safety"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "git-checkpoint",
@@ -27,8 +27,8 @@
       "description": "Auto-commit or stash at turn boundaries for safe rollback",
       "tags": ["git", "workflow"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "mcp-tools",
@@ -36,8 +36,8 @@
       "description": "Expose MCP server tools as native Aar tools",
       "tags": ["tool"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "observability",
@@ -45,8 +45,8 @@
       "description": "Prometheus/OTEL metrics for each agent turn",
       "tags": ["observability", "workflow"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "usage-tracker",
@@ -54,8 +54,26 @@
       "description": "Track per-provider API quota and usage via ~/.aar/usage.json",
       "tags": ["observability", "workflow"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
-      "status": "planned"
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
+    },
+    {
+      "name": "inspect",
+      "pypi": "aar-ext-inspect",
+      "description": "Slash-commands extension that adds a /inspect command to analyze the current session and print a human-readable report.",
+      "tags": ["ui", "observability"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
+    },
+    {
+      "name": "shadow-branching",
+      "pypi": "aar-ext-shadow-branching",
+      "description": "Session-scoped git isolation with checkpoints, forks, and safe merge-back for Aar agent sessions.",
+      "tags": ["git", "safety"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
     },
     {
       "name": "companion",
@@ -63,7 +81,7 @@
       "description": "Living digital AI companion with mood, level, and XP tracking",
       "tags": ["ui", "game"],
       "author": "Aar Team",
-      "repository": "https://github.com/fischerf/aar",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
       "status": "builtin"
     }
   ]
