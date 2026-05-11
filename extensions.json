@@ -7,9 +7,7 @@
       "name": "permission-gate",
       "pypi": "aar-ext-permission-gate",
       "description": "Confirm before dangerous bash commands (rm -rf, sudo, etc.)",
-      "tags": [
-        "safety"
-      ],
+      "tags": ["safety"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "planned"
@@ -18,9 +16,7 @@
       "name": "protected-paths",
       "pypi": "aar-ext-protected-paths",
       "description": "Block writes to .env, secrets files, and sensitive paths",
-      "tags": [
-        "safety"
-      ],
+      "tags": ["safety"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "planned"
@@ -29,10 +25,7 @@
       "name": "git-checkpoint",
       "pypi": "aar-ext-git-checkpoint",
       "description": "Auto-commit or stash at turn boundaries for safe rollback",
-      "tags": [
-        "git",
-        "workflow"
-      ],
+      "tags": ["git", "workflow"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "planned"
@@ -41,9 +34,7 @@
       "name": "mcp-tools",
       "pypi": "aar-ext-mcp-tools",
       "description": "Expose MCP server tools as native Aar tools",
-      "tags": [
-        "tool"
-      ],
+      "tags": ["tool"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "planned"
@@ -52,10 +43,16 @@
       "name": "observability",
       "pypi": "aar-ext-observability",
       "description": "Prometheus/OTEL metrics for each agent turn",
-      "tags": [
-        "observability",
-        "workflow"
-      ],
+      "tags": ["observability", "workflow"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar",
+      "status": "planned"
+    },
+    {
+      "name": "usage-tracker",
+      "pypi": "aar-ext-usage-tracker",
+      "description": "Track per-provider API quota and usage via ~/.aar/usage.json",
+      "tags": ["observability", "workflow"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "planned"
@@ -64,10 +61,7 @@
       "name": "companion",
       "pypi": "aar-ext-companion",
       "description": "Living digital AI companion with mood, level, and XP tracking",
-      "tags": [
-        "ui",
-        "game"
-      ],
+      "tags": ["ui", "game"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar",
       "status": "builtin"

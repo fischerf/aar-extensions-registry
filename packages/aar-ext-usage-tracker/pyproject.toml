@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-usage-tracker"
+version = "0.1.0"
+description = "Track per-provider API quota and usage via ~/.aar/usage.json"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aar-agent"]
+keywords = ["aar-extension", "observability", "quota"]
+license = {text = "Apache-2.0"}
+
+[project.entry-points."aar_extensions"]
+usage_tracker = "aar_ext_usage_tracker:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_usage_tracker"]
