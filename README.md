@@ -59,6 +59,10 @@ Deploy site/ to GitHub Pages or any static host.
 
 See the [Aar Extension Developer Guide](https://github.com/fischerf/aar/blob/main/docs/extensions.md).
 
+## Author
+
+**Florian Fischer** — [Discord](https://discord.gg/xYJNHJV7Bh)
+
 ## License
 
 Apache License 2.0 same as Aar
