@@ -1,8 +1,7 @@
 """Aar extension: usage-tracker — API quota tracking via ~/.aar/usage.json.
 
 Tracks per-provider monthly request counts and token usage.  Warns when
-approaching quota limits and provides a ``/usage`` slash command and a
-``usage_status`` tool the LLM can invoke.
+approaching quota limits and provides a ``/usage`` slash command.
 
 Quota limits are read from the active provider's ``extra.quota`` config::
 
@@ -405,33 +404,3 @@ def register(api: Any) -> None:
         tracker.load()  # reload latest from disk
         provider = args.strip() if args and args.strip() else None
         return tracker.format_status(provider_key=provider)
-
-    # -- tool ---------------------------------------------------------------
-
-    @api.tool(
-        name="usage_status",
-        description=(
-            "Show current API usage statistics and quota status. "
-            "Returns monthly request counts, token usage, and remaining quota."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "provider": {
-                    "type": "string",
-                    "description": "Optional provider key to filter (e.g. 'claude', 'gp')",
-                },
-            },
-            "additionalProperties": False,
-        },
-    )
-    def usage_status_tool(provider: str = "", **kwargs: Any) -> str:
-        tracker.load()
-        return tracker.format_status(provider_key=provider or None)
-
-    # -- system prompt hint -------------------------------------------------
-
-    api.append_system_prompt(
-        "The /usage command shows API quota and usage statistics. "
-        "Use the usage_status tool to check remaining monthly requests."
-    )

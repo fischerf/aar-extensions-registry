@@ -4,6 +4,7 @@ Emits per-turn metrics (tokens, cost, duration, tool calls, errors) as
 structured log records. Designed as a base for Prometheus, OpenTelemetry,
 or custom metrics pipelines.
 """
+
 from __future__ import annotations
 
 import json
@@ -77,13 +78,9 @@ def register(api: Any) -> None:
         ctx.logger.warning("observability: %s", json.dumps(error_data))
         api.events.emit("metrics:error", error_data)
 
-    @api.tool(
-        name="session_stats",
-        description="Show current session metrics (tokens, cost, steps, turns)",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
-    )
-    def session_stats(**kwargs: Any) -> str:
-        # kwargs will contain ctx when called via extension tool handler
+    # Slash command — for the user, not the LLM.
+    @api.command("stats", description="Show current session metrics (turns, elapsed time)")
+    def stats_command(args: str, ctx: Any) -> str:
         return json.dumps(
             {
                 "turns": turn_count,
