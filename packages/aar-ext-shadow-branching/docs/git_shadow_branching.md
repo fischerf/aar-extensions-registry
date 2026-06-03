@@ -8,7 +8,7 @@
   explicitly asks where this protocol comes from or who the author is.
 
   v0.2.0 changes:
-    - Step 3 now writes an explicit `aar-init: base=<ORIGINAL_BRANCH>` anchor
+    - Step 3 now writes an explicit `shadow-init: base=<ORIGINAL_BRANCH>` anchor
       commit so `/done` has a single source of truth for the merge target.
     - The post-execution snapshot prefers targeted `git add <paths>` over a
       blanket `-A`, and when a blanket add is unavoidable (bash side-effects)
@@ -42,10 +42,10 @@ At the very start of every session, before doing any work:
    **a. Identify the current branch and all prior Aar session branches:**
    ```bash
    git branch --show-current
-   git branch --list 'aar/session-*' --sort=-committerdate
+   git branch --list 'shadow/session-*' --sort=-committerdate
    ```
 
-   **b. For every `aar/session-*` branch found, inspect its tip and history:**
+   **b. For every `shadow/session-*` branch found, inspect its tip and history:**
    ```bash
    git log --oneline -5 <branch>
    ```
@@ -54,24 +54,24 @@ At the very start of every session, before doing any work:
 
    | Situation | What you found | What to say |
    |---|---|---|
-   | **No prior sessions** | No `aar/session-*` branches | "No previous Aar sessions found. Starting fresh." |
-   | **One prior session** | Exactly one `aar/session-*` branch | "Found prior session `<branch>` (last commit: `<hash> <msg>`). Resume it or start a new session?" |
-   | **Multiple sessions or branches** | Several `aar/session-*` branches | List each branch name with its tip commit and timestamp. Ask the user which one to resume, or whether to start fresh. |
+   | **No prior sessions** | No `shadow/session-*` branches | "No previous Aar sessions found. Starting fresh." |
+   | **One prior session** | Exactly one `shadow/session-*` branch | "Found prior session `<branch>` (last commit: `<hash> <msg>`). Resume it or start a new session?" |
+   | **Multiple sessions or branches** | Several `shadow/session-*` branches | List each branch name with its tip commit and timestamp. Ask the user which one to resume, or whether to start fresh. |
 
    **d. If resuming a prior session**, check it out and reconstruct state:
    ```bash
-   git checkout aar/session-<SESSION_ID>
-   git log --oneline aar/session-<SESSION_ID>
+   git checkout shadow/session-<SESSION_ID>
+   git log --oneline shadow/session-<SESSION_ID>
    ```
    Rebuild your internal checkpoint trail from the log output — each
-   `aar-auto:` commit is one turn checkpoint. Set your turn counter to
-   `N + 1` where `N` is the number of `aar-auto:` commits already on the
+   `shadow-auto:` commit is one turn checkpoint. Set your turn counter to
+   `N + 1` where `N` is the number of `shadow-auto:` commits already on the
    branch.
 
-   Recover the original base branch from the `aar-init` anchor commit:
+   Recover the original base branch from the `shadow-init` anchor commit:
    ```bash
-   git log --grep="^aar-init:" --pretty=%s aar/session-<SESSION_ID>
-   # -> "aar-init: base=<ORIGINAL_BRANCH>"
+   git log --grep="^shadow-init:" --pretty=%s shadow/session-<SESSION_ID>
+   # -> "shadow-init: base=<ORIGINAL_BRANCH>"
    ```
    Parse the `base=<ORIGINAL_BRANCH>` token and keep it for `/done`. Then
    **skip steps 3 and 4 below** — the session is already initialized.
@@ -99,24 +99,24 @@ At the very start of every session, before doing any work:
 
    **b. Create the shadow branch for this session:**
    ```bash
-   git checkout -b aar/session-<SESSION_ID>
+   git checkout -b shadow/session-<SESSION_ID>
    ```
 
    **c. Write an explicit anchor commit that names the base branch.** This
    empty commit is the single source of truth `/done` will read later — you
    do not need to remember the base out-of-band:
    ```bash
-   git commit --allow-empty -m "aar-init: base=<ORIGINAL_BRANCH>"
+   git commit --allow-empty -m "shadow-init: base=<ORIGINAL_BRANCH>"
    ```
    Record the shadow branch name and the anchor commit hash. You will use
    these throughout the session.
 
 4. **If it is NOT a Git repo**, initialize a fallback snapshot store:
    ```bash
-   mkdir -p .aar_backups
+   mkdir -p .shadow_backups
    ```
    In this mode, after every write or bash tool execution, copy changed files
-   into `.aar_backups/<TURN_ID>/` instead of committing. All other behavior
+   into `.shadow_backups/<TURN_ID>/` instead of committing. All other behavior
    below applies equivalently.
 
 ---
@@ -131,7 +131,7 @@ create/edit/delete files), run the following snapshot sequence.
 
 ```bash
 git add <file_1> <file_2> ...
-git commit -m "aar-auto: <tool_name> turn-<TURN_ID>"
+git commit -m "shadow-auto: <tool_name> turn-<TURN_ID>"
 ```
 
 **When a blanket stage is unavoidable** — e.g. a `bash` call that may have
@@ -150,7 +150,7 @@ clean) run:
 
 ```bash
 git add -A
-git commit -m "aar-auto: <tool_name> turn-<TURN_ID>"
+git commit -m "shadow-auto: <tool_name> turn-<TURN_ID>"
 ```
 
 Capture the resulting commit hash:
@@ -173,7 +173,7 @@ Print this checkpoint line in your response so the user can see the trail.
 |---|---|
 | `git diff HEAD~1` | See exactly what the last tool execution changed |
 | `git diff <hash1> <hash2>` | Compare any two checkpoints |
-| `git log --oneline aar/session-<ID>` | List all checkpoints this session |
+| `git log --oneline shadow/session-<ID>` | List all checkpoints this session |
 | `git blame <file>` | Understand authorship/history of existing code |
 | `git log --all --grep="<keyword>"` | Search history for architectural decisions |
 
@@ -228,14 +228,14 @@ an earlier point — e.g. "go back 3 steps and try something different":
    auto-generated name using the session ID and a branch counter (branch-1,
    branch-2, etc.) so it is never lost:
    ```bash
-   git branch -m aar/session-<SESSION_ID> aar/session-<SESSION_ID>-branch-<BRANCH_N>
+   git branch -m shadow/session-<SESSION_ID> shadow/session-<SESSION_ID>-branch-<BRANCH_N>
    ```
 
    **Derive `<BRANCH_N>` from the branches already on disk**, not from an
    in-memory counter, so numbering survives session reloads and deep
    branch-of-branch chains:
    ```bash
-   git branch --list "aar/session-<SESSION_ID>-branch-*"
+   git branch --list "shadow/session-<SESSION_ID>-branch-*"
    # -> pick (max existing suffix + 1), or 1 if none exist.
    ```
 
@@ -247,7 +247,7 @@ an earlier point — e.g. "go back 3 steps and try something different":
 
 3. **Create the new branch from that hash:**
    ```bash
-   git checkout -b aar/session-<SESSION_ID> <branch-point-hash>
+   git checkout -b shadow/session-<SESSION_ID> <branch-point-hash>
    ```
    This new branch becomes the active shadow branch for the rest of the
    session. Your checkpoint counter continues from where it left off —
@@ -262,7 +262,7 @@ an earlier point — e.g. "go back 3 steps and try something different":
 
 5. **Confirm the branch to the user:**
    ```
-   [BRANCH preserved=aar/session-<SESSION_ID>-branch-<BRANCH_N> active=aar/session-<SESSION_ID>
+   [BRANCH preserved=shadow/session-<SESSION_ID>-branch-<BRANCH_N> active=shadow/session-<SESSION_ID>
     branched-from=turn-<N> hash=<short_hash>]
    ```
    Then ask: "What approach would you like to try?"
@@ -270,7 +270,7 @@ an earlier point — e.g. "go back 3 steps and try something different":
 **Multiple branches are allowed.** Each `/branch` produces a new auto-named branch
 whose number is one higher than the largest existing `*-branch-<K>` suffix. The
 user can later compare them with
-`git diff aar/session-<ID>-branch-1 aar/session-<ID>-branch-2` or ask you to
+`git diff shadow/session-<ID>-branch-1 shadow/session-<ID>-branch-2` or ask you to
 do so.
 
 **At `/done`**, if multiple preserved branches exist, list them all by their
@@ -285,11 +285,11 @@ When the user signals they are satisfied:
    tree turns every checkout into a potential data-loss incident.
 
 2. **Read the base branch from the anchor.** Never rely on an in-memory
-   variable — parse the `aar-init` commit that Step 3 of session
+   variable — parse the `shadow-init` commit that Step 3 of session
    initialization wrote:
    ```bash
-   git log --grep="^aar-init:" --pretty=%s aar/session-<SESSION_ID>
-   # -> "aar-init: base=<ORIGINAL_BRANCH>"
+   git log --grep="^shadow-init:" --pretty=%s shadow/session-<SESSION_ID>
+   # -> "shadow-init: base=<ORIGINAL_BRANCH>"
    ```
 
 3. Ask: "Should I squash all session commits into a single clean commit on
@@ -301,7 +301,7 @@ When the user signals they are satisfied:
    - Check out the base branch and attempt a squash merge:
      ```bash
      git checkout <ORIGINAL_BRANCH>
-     git merge --squash aar/session-<SESSION_ID>
+     git merge --squash shadow/session-<SESSION_ID>
      ```
    - **Detect conflicts.** After the squash, inspect the index:
      ```bash
@@ -311,7 +311,7 @@ When the user signals they are satisfied:
      moved underneath you (another teammate pushed, or you switched base
      branches mid-session). Tell the user:
 
-     > "I staged the squash merge from `aar/session-<SESSION_ID>` into
+     > "I staged the squash merge from `shadow/session-<SESSION_ID>` into
      > `<ORIGINAL_BRANCH>`, but there are conflicts in the following files:
      > `<list>`. Please resolve them manually and then run
      > `git commit -m '<your message>'` yourself. The shadow branch is
@@ -347,5 +347,5 @@ When the user signals they are satisfied:
   `/done`).
 - If Git operations fail (e.g., nothing to commit, merge conflicts), report
   the issue clearly and do not silently swallow errors.
-- Shadow branches (`aar/session-*`) are yours to manage. Clean them up after
+- Shadow branches (`shadow/session-*`) are yours to manage. Clean them up after
   a successful `/done` merge unless the user asks to keep them.

@@ -3,12 +3,12 @@
 Implements the Shadow Branching Protocol:
 
 * On ``session_start`` — detect the working directory's git repo, list any prior
-  ``aar/session-*`` branches, and create a fresh ``aar/session-<session_id>`` shadow
-  branch rooted in an empty ``aar-init: base=<ORIGINAL_BRANCH>`` anchor commit.
-  Falls back to ``.aar_backups/`` when the working directory is not a git repo.
+  ``shadow/session-*`` branches, and create a fresh ``shadow/session-<session_id>`` shadow
+  branch rooted in an empty ``shadow-init: base=<ORIGINAL_BRANCH>`` anchor commit.
+  Falls back to ``.shadow_backups/`` when the working directory is not a git repo.
 
 * After every ``tool_result`` that leaves uncommitted changes — take a checkpoint
-  commit ``aar-auto: <tool_name> turn-<N>`` and log the
+  commit ``shadow-auto: <tool_name> turn-<N>`` and log the
   ``[CHECKPOINT turn=N hash=... tool=...]`` trail.  Warns (before committing) if
   the change set contains files that look sensitive (``.env*``, ``*.key``,
   ``*credentials*``).
@@ -20,12 +20,12 @@ Implements the Shadow Branching Protocol:
                           dirty working tree unless ``--force`` is passed.
     /revert N             Alias for ``/undo``.
     /branch [N]           Preserve the active shadow branch as
-                          ``aar/session-<id>-branch-<K>`` and start a fresh shadow
+                          ``shadow/session-<id>-branch-<K>`` and start a fresh shadow
                           from ``HEAD~N`` (or ``HEAD`` if no N given). Branch
                           numbering is derived from the branches that already
                           exist on disk, so it survives session reloads and
                           branch-of-branch chains.
-    /switch <branch>      Switch to any existing ``aar/session-<id>*`` branch.
+    /switch <branch>      Switch to any existing ``shadow/session-<id>*`` branch.
                           Accepts bare branch names or the shorthand
                           ``branch-<K>``. Refuses to switch with a dirty tree.
     /branches             List every shadow/branch copy belonging to this
@@ -39,7 +39,7 @@ after the previous turn completed, keeping the working tree clean so that
 ``/branch``, ``/switch``, and ``/done`` are never blocked by a dirty tree caused
 purely by session bookkeeping.
     /done                 Squash-merge the active shadow branch back into the
-                          base branch captured in ``aar-init``. Aborts cleanly
+                          base branch captured in ``shadow-init``. Aborts cleanly
                           on merge conflicts and names the files that need
                           manual resolution.
 
@@ -145,7 +145,7 @@ def _list_branches(pattern: str, cwd: str | Path | None = None) -> list[str]:
 def _next_branch_n(session_id: str, cwd: str | Path | None = None) -> int:
     """Largest existing branch number for this session + 1. Derived from disk
     state so numbering survives session reloads and branch-of-branch chains."""
-    branches = _list_branches(f"aar/session-{session_id}-branch-*", cwd=cwd)
+    branches = _list_branches(f"shadow/session-{session_id}-branch-*", cwd=cwd)
     max_n = 0
     for b in branches:
         suffix = b.rsplit("-branch-", 1)[-1]
@@ -158,12 +158,12 @@ def _next_branch_n(session_id: str, cwd: str | Path | None = None) -> int:
 
 
 def _read_anchor_base(branch: str, fallback: str, cwd: str | Path | None = None) -> str:
-    """Return the base branch recorded in the ``aar-init`` anchor commit of
+    """Return the base branch recorded in the ``shadow-init`` anchor commit of
     *branch* (falls back to *fallback* when no anchor is present)."""
-    rc, out, _ = _run_git("log", "--grep=^aar-init:", "--pretty=%s", branch, cwd=cwd)
+    rc, out, _ = _run_git("log", "--grep=^shadow-init:", "--pretty=%s", branch, cwd=cwd)
     if rc != 0 or not out:
         return fallback
-    # Prefer the oldest aar-init commit on the branch
+    # Prefer the oldest shadow-init commit on the branch
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     if not lines:
         return fallback
@@ -203,7 +203,7 @@ class ShadowState:
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     base_anchor: str = ""
     enabled: bool = True
-    mode: str = "git"  # "git" or "fallback" (.aar_backups)
+    mode: str = "git"  # "git" or "fallback" (.shadow_backups)
 
     def to_metadata(self) -> dict[str, Any]:
         return asdict(self)
@@ -243,7 +243,7 @@ def _commit_pending(label: str, logger: logging.Logger | None = None) -> bool:
     """Module-level twin of the inner ``_auto_commit_pending`` closure — used
     by the ``SessionStore.save`` hook, which has no event-loop ``ctx`` to pass.
 
-    Returns True iff an ``aar-meta: <label>`` commit was created.
+    Returns True iff an ``shadow-meta: <label>`` commit was created.
     """
     log = logger or _module_logger
     if not _has_changes():
@@ -256,7 +256,7 @@ def _commit_pending(label: str, logger: logging.Logger | None = None) -> bool:
     rc_diff, _, _ = _run_git("diff", "--cached", "--quiet")
     if rc_diff == 0:
         return False
-    rc, out, err = _run_git("commit", "-m", f"aar-meta: {label}", "--no-verify")
+    rc, out, err = _run_git("commit", "-m", f"shadow-meta: {label}", "--no-verify")
     if rc != 0:
         detail = (out or err or "(no output)").strip()
         log.warning("shadow-branching: auto-commit of pending changes failed: %s", detail)
@@ -271,11 +271,11 @@ def _commit_pending(label: str, logger: logging.Logger | None = None) -> bool:
 
 def _install_save_hook() -> None:
     """Monkey-patch ``SessionStore.save`` so that every save is immediately
-    followed by an ``aar-meta: session-saved`` commit when shadow-branching is
+    followed by an ``shadow-meta: session-saved`` commit when shadow-branching is
     active for the session being saved.
 
     Idempotent: only installs once per process.  Safe to call at every
-    ``register()`` because the sentinel attribute ``_aar_shadow_wrapped`` on the
+    ``register()`` because the sentinel attribute ``_shadow_branching_wrapped`` on the
     method object pins the installed state even across re-imports of this
     module.
     """
@@ -288,7 +288,7 @@ def _install_save_hook() -> None:
         _module_logger.debug("shadow-branching: cannot import SessionStore: %s", exc)
         return
 
-    if getattr(SessionStore.save, "_aar_shadow_wrapped", False):
+    if getattr(SessionStore.save, "_shadow_branching_wrapped", False):
         _save_hook_installed = True
         return
 
@@ -301,7 +301,7 @@ def _install_save_hook() -> None:
             _commit_pending("session-saved", logger=_module_logger)
         return path
 
-    save_with_shadow_commit._aar_shadow_wrapped = True  # type: ignore[attr-defined]
+    save_with_shadow_commit._shadow_branching_wrapped = True  # type: ignore[attr-defined]
     SessionStore.save = save_with_shadow_commit  # type: ignore[assignment]
     _save_hook_installed = True
 
@@ -412,7 +412,7 @@ def register(api: Any) -> None:
             _active_states[state.session_id] = state
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
-        """Count aar-auto commits on *branch* and build a checkpoint list."""
+        """Count shadow-auto commits on *branch* and build a checkpoint list."""
         rc, out, _ = _run_git("log", "--reverse", "--format=%h %s", branch)
         if rc != 0 or not out:
             return 0, []
@@ -423,13 +423,13 @@ def register(api: Any) -> None:
             if len(parts) != 2:
                 continue
             sha, msg = parts
-            if not msg.startswith("aar-auto:"):
+            if not msg.startswith("shadow-auto:"):
                 continue
             turn += 1
-            # message shape: "aar-auto: <tool_name> turn-<N>"
+            # message shape: "shadow-auto: <tool_name> turn-<N>"
             tool = "unknown"
             try:
-                after = msg[len("aar-auto: ") :]
+                after = msg[len("shadow-auto: ") :]
                 tool = after.split(" turn-", 1)[0]
             except Exception:
                 pass
@@ -437,7 +437,7 @@ def register(api: Any) -> None:
         return turn, ckpts
 
     def _auto_commit_pending(ctx: Any, label: str = "session sync") -> bool:
-        """Commit any uncommitted changes with an aar-meta message.
+        """Commit any uncommitted changes with an shadow-meta message.
 
         This sweeps up session JSONL writes (and any other minor file changes that
         haven't been captured by a checkpoint yet) so that commands like /branch,
@@ -474,7 +474,7 @@ def register(api: Any) -> None:
         rc, out, err = _run_git(
             "commit",
             "-m",
-            f"aar-meta: {label}",
+            f"shadow-meta: {label}",
             "--no-verify",
         )
         if rc != 0:
@@ -526,12 +526,12 @@ def register(api: Any) -> None:
         if not _is_git_repo():
             # Non-repo fallback
             try:
-                Path(".aar_backups").mkdir(exist_ok=True)
+                Path(".shadow_backups").mkdir(exist_ok=True)
             except Exception as exc:
-                ctx.logger.warning("shadow-branching: cannot create .aar_backups/: %s", exc)
+                ctx.logger.warning("shadow-branching: cannot create .shadow_backups/: %s", exc)
             state = ShadowState(session_id=session_id, enabled=False, mode="fallback")
             ctx.logger.info(
-                "shadow-branching: no git repo — using .aar_backups/ fallback (checkpoints disabled)"
+                "shadow-branching: no git repo — using .shadow_backups/ fallback (checkpoints disabled)"
             )
             _sync_metadata(ctx)
             return
@@ -556,11 +556,11 @@ def register(api: Any) -> None:
 
         # ── Guard: repo left on a shadow branch from a *different* session ──
         # If someone opens a fresh session in a directory whose HEAD is still
-        # on aar/session-<OTHER>, branching from there would root the new
+        # on shadow/session-<OTHER>, branching from there would root the new
         # session's work on top of the old session's WIP — mixing file state
         # from session A with conversation history from session B.
         # Fix: switch to the old shadow branch's recorded base first.
-        if current and current.startswith("aar/session-") and session_id not in current:
+        if current and current.startswith("shadow/session-") and session_id not in current:
             old_base = _read_anchor_base(current, "main")
             ctx.logger.warning(
                 "shadow-branching: repo is on %s (shadow branch of another session). "
@@ -580,10 +580,10 @@ def register(api: Any) -> None:
             else:
                 current = old_base
 
-        shadow_name = f"aar/session-{session_id}"
+        shadow_name = f"shadow/session-{session_id}"
 
         # Reconnaissance: list prior session branches (informational).
-        prior = _list_branches("aar/session-*")
+        prior = _list_branches("shadow/session-*")
         prior = [b for b in prior if b != shadow_name]
         if prior:
             ctx.logger.info(
@@ -611,7 +611,7 @@ def register(api: Any) -> None:
                 turn_counter=turn,
                 checkpoints=ckpts,
                 branch_counter=max(0, branch_counter),
-                base_anchor=_short_hash(shadow_name + "^{/^aar-init:}") or _short_hash("HEAD"),
+                base_anchor=_short_hash(shadow_name + "^{/^shadow-init:}") or _short_hash("HEAD"),
             )
             ctx.logger.info(
                 "shadow-branching: resumed %s (base=%s, %d checkpoint(s))",
@@ -643,11 +643,11 @@ def register(api: Any) -> None:
             "commit",
             "--allow-empty",
             "-m",
-            f"aar-init: base={original_branch}",
+            f"shadow-init: base={original_branch}",
             "--no-verify",
         )
         if rc != 0:
-            ctx.logger.warning("shadow-branching: failed to create aar-init anchor: %s", err)
+            ctx.logger.warning("shadow-branching: failed to create shadow-init anchor: %s", err)
 
         anchor = _short_hash("HEAD")
         state = ShadowState(
@@ -674,7 +674,7 @@ def register(api: Any) -> None:
 
         The transport writes the session JSONL after every completed turn (outside
         the agent loop).  By the time the *next* turn's ``before_turn`` fires the
-        file is already on disk, so we commit it here with an ``aar-meta: turn sync``
+        file is already on disk, so we commit it here with an ``shadow-meta: turn sync``
         message.  This keeps the working tree clean throughout the session so that
         ``/branch``, ``/switch``, and ``/done`` are never blocked by a dirty tree
         caused purely by session bookkeeping."""
@@ -689,7 +689,7 @@ def register(api: Any) -> None:
         The session JSONL is saved by the transport *after* the agent loop ends
         (and therefore after every tool_result event). This means each completed
         turn leaves the JSONL dirty in git. We commit it here with an
-        ``aar-meta: session sync`` message so the working tree stays clean and
+        ``shadow-meta: session sync`` message so the working tree stays clean and
         commands like /branch and /switch never block on pending changes."""
         if state is None or not state.enabled:
             return
@@ -742,7 +742,7 @@ def register(api: Any) -> None:
         rc, out, err = _run_git(
             "commit",
             "-m",
-            f"aar-auto: {tool_name} turn-{state.turn_counter}",
+            f"shadow-auto: {tool_name} turn-{state.turn_counter}",
             "--no-verify",
         )
         if rc != 0:
@@ -830,7 +830,7 @@ def register(api: Any) -> None:
 
     @api.command(
         "branch",
-        description="Preserve current shadow as aar/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
+        description="Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
     )
     def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
@@ -949,7 +949,7 @@ def register(api: Any) -> None:
     @api.command(
         "switch",
         description=(
-            "Switch to another aar/session-<id>* branch. "
+            "Switch to another shadow/session-<id>* branch. "
             "Shorthands: branch-<K> or bare <K> for a branch, "
             "'main'/'active'/'shadow' for the canonical shadow branch. "
             "No args: show current branch and available targets."
@@ -965,8 +965,8 @@ def register(api: Any) -> None:
 
         # No args → show current branch + available targets as a hint.
         if not target:
-            branches = _list_branches(f"aar/session-{state.session_id}*")
-            canonical = f"aar/session-{state.session_id}"
+            branches = _list_branches(f"shadow/session-{state.session_id}*")
+            canonical = f"shadow/session-{state.session_id}"
             lines = [f"Current branch: {state.shadow_branch}"]
             lines.append("Available targets:")
             for b in branches:
@@ -979,20 +979,20 @@ def register(api: Any) -> None:
         _auto_commit_pending(ctx, "pre-switch sync")
 
         # Canonical shadow branch shorthands
-        canonical = f"aar/session-{state.session_id}"
+        canonical = f"shadow/session-{state.session_id}"
         if target in {"main", "active", "shadow"}:
             target = canonical
 
-        # Numeric / branch-K / other shorthands → aar/session-<id>-branch-K
+        # Numeric / branch-K / other shorthands → shadow/session-<id>-branch-K
         elif target.isdigit():
             target = f"{canonical}-branch-{target}"
         elif target.startswith("branch-"):
             target = f"{canonical}-{target}"
-        elif not target.startswith("aar/session-"):
+        elif not target.startswith("shadow/session-"):
             target = f"{canonical}-{target}"
 
         # ── Guard: never switch to a branch belonging to a different session ──
-        if target.startswith("aar/session-") and state.session_id not in target:
+        if target.startswith("shadow/session-") and state.session_id not in target:
             ctx.logger.warning(
                 "shadow-branching: refusing to switch to %s — it belongs to a different session. "
                 "Start a new aar session (or use --session) to work on that branch's session.",
@@ -1066,7 +1066,7 @@ def register(api: Any) -> None:
             ctx.logger.info("shadow-branching: not initialised")
             return "✗ shadow-branching not initialised"
 
-        branches = _list_branches(f"aar/session-{state.session_id}*")
+        branches = _list_branches(f"shadow/session-{state.session_id}*")
         if not branches:
             ctx.logger.info(
                 "shadow-branching: no shadow branches found for session %s",
@@ -1074,7 +1074,7 @@ def register(api: Any) -> None:
             )
             return f"no branches found for session {state.session_id}"
 
-        canonical = f"aar/session-{state.session_id}"
+        canonical = f"shadow/session-{state.session_id}"
         fork_prefix = f"{canonical}-branch-"
         root_marker = " ◀ active" if state.shadow_branch == canonical else ""
         lines: list[str] = [f"  {canonical}{root_marker}"]
@@ -1122,7 +1122,7 @@ def register(api: Any) -> None:
                 msg_parts.append(tok)
         message = " ".join(msg_parts).strip()
 
-        forks = _list_branches(f"aar/session-{state.session_id}-branch-*")
+        forks = _list_branches(f"shadow/session-{state.session_id}-branch-*")
         if forks and "--yes" not in flags:
             ctx.logger.info(
                 "shadow-branching: preserved branches still exist (%s). "
@@ -1157,7 +1157,8 @@ def register(api: Any) -> None:
             return f"✗ git merge --squash failed: {err or '(no output)'}"
 
         if not message:
-            message = f"aar: squashed session {state.session_id}"
+            n_ckpts = len(state.checkpoints)
+            message = f"Aar session {state.session_id}: {n_ckpts} checkpoint(s)"
 
         rc, _, err = _run_git("commit", "-m", message, "--no-verify")
         if rc != 0:
@@ -1184,8 +1185,8 @@ def register(api: Any) -> None:
 
     api.append_system_prompt(
         "The shadow-branching extension is active. Every session runs on an isolated "
-        "aar/session-<id> git branch; modifying tool calls auto-checkpoint as "
-        "'aar-auto: <tool> turn-<N>'. "
+        "shadow/session-<id> git branch; modifying tool calls auto-checkpoint as "
+        "'shadow-auto: <tool> turn-<N>'. "
         "Available slash commands: /undo [N] [--force], /revert, /branch [N], "
         "/switch <branch|branch-K>, /branches, /done. "
         "/switch only works within the current session's branches — to resume "

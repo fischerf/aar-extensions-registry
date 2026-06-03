@@ -169,15 +169,15 @@ def test_session_start_creates_shadow_and_anchor(
     _api, ctx, repo = session_api
 
     assert _short_hash("HEAD", cwd=repo)
-    branches = _list_branches("aar/session-*", cwd=repo)
-    assert branches == ["aar/session-s1"]
+    branches = _list_branches("shadow/session-*", cwd=repo)
+    assert branches == ["shadow/session-s1"]
 
-    # aar-init anchor present
+    # shadow-init anchor present
     log = _git("log", "--oneline", cwd=repo).stdout
-    assert "aar-init: base=main" in log
+    assert "shadow-init: base=main" in log
 
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1"
+    assert st["shadow_branch"] == "shadow/session-s1"
     assert st["original_branch"] == "main"
     assert st["enabled"] is True
     assert st["branch_counter"] == 0
@@ -196,7 +196,7 @@ def test_session_start_without_git_uses_fallback(
     ctx = FakeCtx(FakeSession("s0"))
     api.handlers["session_start"][0](None, ctx)
 
-    assert (plain / ".aar_backups").is_dir()
+    assert (plain / ".shadow_backups").is_dir()
     st = _session_state(ctx)
     assert st["enabled"] is False
     assert st["mode"] == "fallback"
@@ -225,7 +225,7 @@ def test_tool_result_creates_checkpoint(session_api) -> None:
     assert st["checkpoints"][0]["tool"] == "write_file"
 
     log = _git("log", "--oneline", cwd=repo).stdout
-    assert "aar-auto: write_file turn-1" in log
+    assert "shadow-auto: write_file turn-1" in log
 
 
 def test_session_end_commits_dirty_jsonl(session_api) -> None:
@@ -256,9 +256,9 @@ def test_session_end_commits_dirty_jsonl(session_api) -> None:
     )
     assert not result.stdout.strip(), "Working tree must be clean after session_end commit"
 
-    # The commit must use the aar-meta: prefix (not aar-auto:, not a checkpoint)
+    # The commit must use the shadow-meta: prefix (not shadow-auto:, not a checkpoint)
     log = _git("log", "--oneline", cwd=repo).stdout
-    assert "aar-meta: session sync" in log
+    assert "shadow-meta: session sync" in log
 
     # turn_counter and checkpoints must be unchanged (it's not a checkpoint)
     st = _session_state(ctx)
@@ -305,9 +305,9 @@ def test_before_turn_commits_dirty_jsonl_between_turns(session_api) -> None:
     )
     assert not result.stdout.strip(), "Working tree must be clean after before_turn sweep"
 
-    # Committed with the aar-meta: prefix, not as a checkpoint
+    # Committed with the shadow-meta: prefix, not as a checkpoint
     log = _git("log", "--oneline", cwd=repo).stdout
-    assert "aar-meta: turn sync" in log
+    assert "shadow-meta: turn sync" in log
 
     # turn_counter and checkpoints untouched
     st = _session_state(ctx)
@@ -340,9 +340,9 @@ def test_branch_after_tool_free_turns_succeeds(session_api) -> None:
 
     assert result is not None
     assert not result.startswith("✗"), f"Expected success but got: {result}"
-    branches = set(_list_branches("aar/session-*", cwd=repo))
-    assert "aar/session-s1" in branches
-    assert "aar/session-s1-branch-1" in branches
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
+    assert "shadow/session-s1" in branches
+    assert "shadow/session-s1-branch-1" in branches
 
 
 def test_tool_result_no_changes_no_checkpoint(session_api) -> None:
@@ -418,13 +418,13 @@ def test_branch_auto_commits_pending(session_api, caplog: pytest.LogCaptureFixtu
     caplog.set_level(logging.DEBUG)
     _run_cmd(api, "branch", "", ctx)
 
-    branches = set(_list_branches("aar/session-*", cwd=repo))
-    assert "aar/session-s1" in branches
-    assert "aar/session-s1-branch-1" in branches
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
+    assert "shadow/session-s1" in branches
+    assert "shadow/session-s1-branch-1" in branches
 
     # session.jsonl must be committed on the preserved branch
     rc = subprocess.run(
-        ["git", "show", "aar/session-s1-branch-1:session.jsonl"],
+        ["git", "show", "shadow/session-s1-branch-1:session.jsonl"],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -475,10 +475,10 @@ def test_session_store_save_commits_pending_jsonl(session_api, tmp_path: Path) -
         f"tree must be clean after store.save(), got: {result.stdout!r}"
     )
 
-    # And the commit itself must carry the aar-meta: session-saved label.
+    # And the commit itself must carry the shadow-meta: session-saved label.
     log = _git("log", "--oneline", cwd=repo).stdout
-    assert "aar-meta: session-saved" in log, (
-        f"expected 'aar-meta: session-saved' commit, log:\n{log}"
+    assert "shadow-meta: session-saved" in log, (
+        f"expected 'shadow-meta: session-saved' commit, log:\n{log}"
     )
 
 
@@ -565,8 +565,8 @@ def test_branch_refuses_when_pre_sync_fails(
         "expected explicit warning about git add -A failure"
     )
     # And no preserved branch must have been created with the wrong content.
-    branches = set(_list_branches("aar/session-*", cwd=repo))
-    assert "aar/session-s1-branch-1" not in branches, (
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
+    assert "shadow/session-s1-branch-1" not in branches, (
         "branch must not be preserved when pre-sync could not commit pending work"
     )
 
@@ -660,15 +660,15 @@ def test_branch_preserves_current_and_starts_fresh(session_api) -> None:
 
     result = _run_cmd(api, "branch", "", ctx)
 
-    branches = set(_list_branches("aar/session-*", cwd=repo))
-    assert "aar/session-s1" in branches  # new active
-    assert "aar/session-s1-branch-1" in branches  # preserved
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
+    assert "shadow/session-s1" in branches  # new active
+    assert "shadow/session-s1-branch-1" in branches  # preserved
 
-    # Still on the aar/session-s1 branch
+    # Still on the shadow/session-s1 branch
     current = subprocess.run(
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
-    assert current == "aar/session-s1"
+    assert current == "shadow/session-s1"
 
     # a.txt is still present (branched FROM HEAD keeps history identical)
     assert (repo / "a.txt").exists()
@@ -678,7 +678,7 @@ def test_branch_preserves_current_and_starts_fresh(session_api) -> None:
     assert result is not None
     assert result.startswith("⑂")
     assert "branch-1" in result
-    assert "aar/session-s1" in result
+    assert "shadow/session-s1" in result
 
 
 def test_branch_back_n_rewinds(session_api) -> None:
@@ -697,7 +697,7 @@ def test_branch_back_n_rewinds(session_api) -> None:
     assert not (repo / "c.txt").exists()
 
     # Preserved branch still has all three
-    _git("checkout", "aar/session-s1-branch-1", cwd=repo)
+    _git("checkout", "shadow/session-s1-branch-1", cwd=repo)
     assert (repo / "a.txt").exists()
     assert (repo / "b.txt").exists()
     assert (repo / "c.txt").exists()
@@ -706,7 +706,7 @@ def test_branch_back_n_rewinds(session_api) -> None:
 def test_branch_of_branch_of_branch_numbers_monotonically(session_api) -> None:
     """The central scenario: branch -> work -> branch -> work -> branch. Branch numbering
     is derived from the branches already on disk, so we must end with four
-    distinct aar/session-s1 branches (one active + three preserved)."""
+    distinct shadow/session-s1 branches (one active + three preserved)."""
     api, ctx, repo = session_api
 
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")  # turn 1
@@ -718,12 +718,12 @@ def test_branch_of_branch_of_branch_numbers_monotonically(session_api) -> None:
     _write_and_checkpoint(api, ctx, repo, "c.txt", "three")  # turn 3
     _run_cmd(api, "branch", "", ctx)  # preserve -> branch-3
 
-    branches = set(_list_branches("aar/session-*", cwd=repo))
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
     assert branches == {
-        "aar/session-s1",
-        "aar/session-s1-branch-1",
-        "aar/session-s1-branch-2",
-        "aar/session-s1-branch-3",
+        "shadow/session-s1",
+        "shadow/session-s1-branch-1",
+        "shadow/session-s1-branch-2",
+        "shadow/session-s1-branch-3",
     }
 
     st = _session_state(ctx)
@@ -731,17 +731,17 @@ def test_branch_of_branch_of_branch_numbers_monotonically(session_api) -> None:
 
     # Each preserved branch should hold the cumulative files at the time it was
     # branched — branch-1 has only a.txt, branch-2 has a+b, branch-3 has a+b+c.
-    _git("checkout", "aar/session-s1-branch-1", cwd=repo)
+    _git("checkout", "shadow/session-s1-branch-1", cwd=repo)
     assert (repo / "a.txt").exists()
     assert not (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
 
-    _git("checkout", "aar/session-s1-branch-2", cwd=repo)
+    _git("checkout", "shadow/session-s1-branch-2", cwd=repo)
     assert (repo / "a.txt").exists()
     assert (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
 
-    _git("checkout", "aar/session-s1-branch-3", cwd=repo)
+    _git("checkout", "shadow/session-s1-branch-3", cwd=repo)
     assert (repo / "a.txt").exists()
     assert (repo / "b.txt").exists()
     assert (repo / "c.txt").exists()
@@ -757,8 +757,8 @@ def test_branch_beyond_checkpoints_is_refused(
     result = _run_cmd(api, "branch", "9", ctx)
 
     assert any("cannot branch" in rec.getMessage() for rec in caplog.records)
-    branches = _list_branches("aar/session-s1*", cwd=repo)
-    assert branches == ["aar/session-s1"]  # unchanged
+    branches = _list_branches("shadow/session-s1*", cwd=repo)
+    assert branches == ["shadow/session-s1"]  # unchanged
     assert result is not None
     assert result.startswith("✗")
     assert "1 checkpoint" in result
@@ -780,17 +780,17 @@ def test_switch_no_args_shows_hint(session_api) -> None:
 
     assert result is not None
     assert "Current branch:" in result
-    assert "aar/session-s1" in result
-    assert "aar/session-s1-branch-1" in result
+    assert "shadow/session-s1" in result
+    assert "shadow/session-s1-branch-1" in result
     assert "Usage:" in result
     # Must NOT have switched — still on the active shadow
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1"
+    assert st["shadow_branch"] == "shadow/session-s1"
 
 
 def test_switch_main_shorthand_returns_to_canonical_shadow(session_api) -> None:
     """'main', 'active', and 'shadow' keywords all switch back to the canonical
-    aar/session-<id> branch from a preserved branch copy."""
+    shadow/session-<id> branch from a preserved branch copy."""
     api, ctx, repo = session_api
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
     _run_cmd(api, "branch", "", ctx)
@@ -798,14 +798,14 @@ def test_switch_main_shorthand_returns_to_canonical_shadow(session_api) -> None:
 
     # Switch away to the preserved branch first
     _run_cmd(api, "switch", "branch-1", ctx)
-    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1-branch-1"
+    assert _session_state(ctx)["shadow_branch"] == "shadow/session-s1-branch-1"
 
     # Switch back using 'main'
     result = _run_cmd(api, "switch", "main", ctx)
     assert result is not None
     assert result.startswith("⇄")
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1"
+    assert st["shadow_branch"] == "shadow/session-s1"
     assert (repo / "b.txt").exists()
 
 
@@ -820,7 +820,7 @@ def test_switch_active_shorthand(session_api) -> None:
 
     assert result is not None
     assert result.startswith("⇄")
-    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1"
+    assert _session_state(ctx)["shadow_branch"] == "shadow/session-s1"
 
 
 def test_switch_shadow_shorthand(session_api) -> None:
@@ -834,7 +834,7 @@ def test_switch_shadow_shorthand(session_api) -> None:
 
     assert result is not None
     assert result.startswith("⇄")
-    assert _session_state(ctx)["shadow_branch"] == "aar/session-s1"
+    assert _session_state(ctx)["shadow_branch"] == "shadow/session-s1"
 
 
 def test_switch_between_forks(session_api) -> None:
@@ -854,7 +854,7 @@ def test_switch_between_forks(session_api) -> None:
     assert not (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1-branch-1"
+    assert st["shadow_branch"] == "shadow/session-s1-branch-1"
     assert st["turn_counter"] == 1
     assert len(st["checkpoints"]) == 1
     assert result is not None
@@ -867,17 +867,17 @@ def test_switch_between_forks(session_api) -> None:
     assert (repo / "b.txt").exists()
     assert not (repo / "c.txt").exists()
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1-branch-2"
+    assert st["shadow_branch"] == "shadow/session-s1-branch-2"
     assert st["turn_counter"] == 2
     assert result is not None
     assert result.startswith("⇄")
     assert "branch-2" in result
 
     # Jump back to the live branch using the full name
-    result = _run_cmd(api, "switch", "aar/session-s1", ctx)
+    result = _run_cmd(api, "switch", "shadow/session-s1", ctx)
     assert (repo / "c.txt").exists()
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1"
+    assert st["shadow_branch"] == "shadow/session-s1"
     assert st["turn_counter"] == 3
     assert result is not None
     assert result.startswith("⇄")
@@ -900,12 +900,12 @@ def test_switch_auto_commits_pending_and_succeeds(
 
     # Switch must have succeeded
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1-branch-1"
+    assert st["shadow_branch"] == "shadow/session-s1-branch-1"
     assert (repo / "a.txt").exists()
     assert not (repo / "b.txt").exists()
 
     # The pending file must have been committed on the shadow branch, not left dirty
-    _git("checkout", "aar/session-s1", cwd=repo)
+    _git("checkout", "shadow/session-s1", cwd=repo)
     rc = subprocess.run(
         ["git", "show", "HEAD:session.jsonl"], cwd=repo, capture_output=True, text=True
     )
@@ -939,7 +939,7 @@ def test_switch_still_warns_on_truly_dirty_after_auto_commit_failure(
 
     assert any("uncommitted changes" in rec.getMessage() for rec in caplog.records)
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-s1"
+    assert st["shadow_branch"] == "shadow/session-s1"
 
 
 def test_switch_unknown_branch(session_api, caplog: pytest.LogCaptureFixture) -> None:
@@ -971,18 +971,18 @@ def test_branches_lists_all_branches_and_marks_active(
 
     # The return value is the canonical output shown in the TUI/CLI
     assert result is not None
-    assert "aar/session-s1" in result
-    assert "aar/session-s1-branch-1" in result
-    assert "aar/session-s1-branch-2" in result
+    assert "shadow/session-s1" in result
+    assert "shadow/session-s1-branch-1" in result
+    assert "shadow/session-s1-branch-2" in result
     # active marker present on exactly one line
     active_lines = [line for line in result.splitlines() if "◀ active" in line]
     assert len(active_lines) == 1
     # active is on the canonical root (no branch suffix) since we did two /branch calls
-    # leaving the active shadow on aar/session-s1
-    assert "aar/session-s1" in active_lines[0] and "branch-" not in active_lines[0]
+    # leaving the active shadow on shadow/session-s1
+    assert "shadow/session-s1" in active_lines[0] and "branch-" not in active_lines[0]
     # log still emitted for the record
     msgs = [rec.getMessage() for rec in caplog.records]
-    assert any("aar/session-s1" in m for m in msgs)
+    assert any("shadow/session-s1" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
@@ -1009,8 +1009,8 @@ def test_done_squashes_shadow_into_base(session_api) -> None:
         ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
     ).stdout
     assert "finishing up" in log
-    # No aar-auto commits on main (they were squashed)
-    assert "aar-auto:" not in log
+    # No shadow-auto commits on main (they were squashed)
+    assert "shadow-auto:" not in log
     assert result is not None
     assert result.startswith("✓")
     assert "main" in result
@@ -1028,10 +1028,10 @@ def test_done_refuses_with_remaining_forks(session_api, caplog: pytest.LogCaptur
     current = subprocess.run(
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
-    assert current == "aar/session-s1"
+    assert current == "shadow/session-s1"
     assert result is not None
     assert result.startswith("⚠")
-    assert "branch" in result  # branch names contain "branch" (aar/session-s1-branch-1)
+    assert "branch" in result  # branch names contain "branch" (shadow/session-s1-branch-1)
     assert "--yes" in result
     assert any("preserved branches still exist" in rec.getMessage() for rec in caplog.records)
 
@@ -1048,14 +1048,14 @@ def test_done_with_yes_proceeds_despite_forks(session_api) -> None:
         ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
     assert current == "main"
-    assert "aar/session-s1-branch-1" in _list_branches("aar/session-s1*", cwd=repo)
+    assert "shadow/session-s1-branch-1" in _list_branches("shadow/session-s1*", cwd=repo)
     assert result is not None
     assert result.startswith("✓")
     assert "main" in result
     # b.txt from the active shadow is on main, but preserved branches still exist
     assert (repo / "b.txt").exists()
-    branches = _list_branches("aar/session-*", cwd=repo)
-    assert "aar/session-s1-branch-1" in branches
+    branches = _list_branches("shadow/session-*", cwd=repo)
+    assert "shadow/session-s1-branch-1" in branches
 
 
 def test_done_aborts_on_merge_conflict(session_api, caplog: pytest.LogCaptureFixture) -> None:
@@ -1069,7 +1069,7 @@ def test_done_aborts_on_merge_conflict(session_api, caplog: pytest.LogCaptureFix
     (repo / "README.md").write_text("main version\n", encoding="utf-8")
     _git("add", "README.md", cwd=repo)
     _git("commit", "-m", "main edit", cwd=repo)
-    _git("checkout", "aar/session-s1", cwd=repo)
+    _git("checkout", "shadow/session-s1", cwd=repo)
 
     caplog.set_level(logging.WARNING)
     result = _run_cmd(api, "done", "--yes", ctx)
@@ -1095,7 +1095,8 @@ def test_done_no_message_uses_default(session_api) -> None:
     log = subprocess.run(
         ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
     ).stdout
-    assert "aar: squashed session s1" in log
+    assert "Aar session s1:" in log
+    assert "checkpoint(s)" in log
     assert result is not None
     assert result.startswith("✓")
 
@@ -1124,7 +1125,7 @@ def test_resume_existing_session_reconstructs_state(repo: Path) -> None:
     api2.handlers["session_start"][0](None, ctx2)
 
     st = _session_state(ctx2)
-    assert st["shadow_branch"] == "aar/session-resume1"
+    assert st["shadow_branch"] == "shadow/session-resume1"
     assert st["original_branch"] == "main"
     assert st["turn_counter"] == 2
     assert len(st["checkpoints"]) == 2
@@ -1138,13 +1139,13 @@ def test_resume_existing_session_reconstructs_state(repo: Path) -> None:
     log = subprocess.run(
         ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
     ).stdout
-    assert "aar-auto: write_file turn-3" in log
+    assert "shadow-auto: write_file turn-3" in log
 
 
 def test_session_start_leaves_other_sessions_untouched(repo: Path) -> None:
     # Simulate a stale shadow branch from a prior session
-    _git("checkout", "-b", "aar/session-zzzold", cwd=repo)
-    _git("commit", "--allow-empty", "-m", "aar-init: base=main", cwd=repo)
+    _git("checkout", "-b", "shadow/session-zzzold", cwd=repo)
+    _git("commit", "--allow-empty", "-m", "shadow-init: base=main", cwd=repo)
     _git("checkout", "main", cwd=repo)
 
     api = FakeAPI()
@@ -1152,9 +1153,9 @@ def test_session_start_leaves_other_sessions_untouched(repo: Path) -> None:
     ctx = FakeCtx(FakeSession("fresh1"))
     api.handlers["session_start"][0](None, ctx)
 
-    branches = set(_list_branches("aar/session-*", cwd=repo))
-    assert "aar/session-zzzold" in branches
-    assert "aar/session-fresh1" in branches
+    branches = set(_list_branches("shadow/session-*", cwd=repo))
+    assert "shadow/session-zzzold" in branches
+    assert "shadow/session-fresh1" in branches
 
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1178,7 @@ def test_session_start_rebases_to_base_when_on_stale_shadow_branch(repo: Path) -
 
     # Confirm HEAD is on the old shadow branch
     branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
-    assert branch_out == "aar/session-old_session"
+    assert branch_out == "shadow/session-old_session"
 
     # Session B: start a NEW session — repo is still on old_session's branch
     api_b = FakeAPI()
@@ -1187,12 +1188,12 @@ def test_session_start_rebases_to_base_when_on_stale_shadow_branch(repo: Path) -
 
     st = _session_state(ctx_b)
     assert st["enabled"] is True
-    assert st["shadow_branch"] == "aar/session-new_session"
+    assert st["shadow_branch"] == "shadow/session-new_session"
     # The new shadow must be rooted on main, NOT on the old shadow branch
     assert st["original_branch"] == "main"
 
-    # The aar-init anchor must record base=main
-    log = _git("log", "--oneline", "--grep=aar-init:", "aar/session-new_session", cwd=repo)
+    # The shadow-init anchor must record base=main
+    log = _git("log", "--oneline", "--grep=shadow-init:", "shadow/session-new_session", cwd=repo)
     assert "base=main" in log.stdout
 
 
@@ -1201,8 +1202,8 @@ def test_session_start_stale_shadow_warning_logged(
 ) -> None:
     """When rebasing away from a stale shadow branch a warning must be logged."""
     # Create old session's shadow branch
-    _git("checkout", "-b", "aar/session-stale1", cwd=repo)
-    _git("commit", "--allow-empty", "-m", "aar-init: base=main", "--no-verify", cwd=repo)
+    _git("checkout", "-b", "shadow/session-stale1", cwd=repo)
+    _git("commit", "--allow-empty", "-m", "shadow-init: base=main", "--no-verify", cwd=repo)
 
     # Start new session while on stale branch
     api = FakeAPI()
@@ -1236,14 +1237,14 @@ def test_switch_rejects_cross_session_branch(repo: Path) -> None:
     api_b.handlers["session_start"][0](None, ctx_b)
 
     # Try to /switch to session A's branch — must be rejected
-    result = _run_cmd(api_b, "switch", "aar/session-sess_a", ctx_b)
+    result = _run_cmd(api_b, "switch", "shadow/session-sess_a", ctx_b)
     assert result is not None
     assert "different session" in result
     assert "✗" in result
 
     # Confirm we're still on session B's branch
     branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
-    assert branch_out == "aar/session-sess_b"
+    assert branch_out == "shadow/session-sess_b"
 
 
 def test_switch_allows_own_session_branches(repo: Path) -> None:
@@ -1299,24 +1300,24 @@ def test_switch_survives_subsequent_session_start(repo: Path) -> None:
     result = _run_cmd(api, "switch", "1", ctx)
     assert result is not None and "⇄" in result
     st = _session_state(ctx)
-    assert st["shadow_branch"] == "aar/session-surv-branch-1"
+    assert st["shadow_branch"] == "shadow/session-surv-branch-1"
 
     # Confirm git HEAD is on branch-1
     branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
-    assert branch_out == "aar/session-surv-branch-1"
+    assert branch_out == "shadow/session-surv-branch-1"
 
     # Simulate the next run_loop call — fires session_start again
     api.handlers["session_start"][0](None, ctx)
 
     # State must still reflect branch-1, NOT the canonical shadow
     st2 = _session_state(ctx)
-    assert st2["shadow_branch"] == "aar/session-surv-branch-1", (
+    assert st2["shadow_branch"] == "shadow/session-surv-branch-1", (
         f"session_start re-initialised and switched back to {st2['shadow_branch']}"
     )
 
     # git HEAD must still be on branch-1
     branch_out2 = _git("branch", "--show-current", cwd=repo).stdout.strip()
-    assert branch_out2 == "aar/session-surv-branch-1", (
+    assert branch_out2 == "shadow/session-surv-branch-1", (
         f"session_start checked out {branch_out2} instead of staying on branch-1"
     )
 
