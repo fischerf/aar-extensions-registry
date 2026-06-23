@@ -1,0 +1,5 @@
+files,turns,shadow,wall_s,checkpoint_mean_ms,checkpoint_p95_ms,objects_kb_before,objects_kb_after,objects_kb_after_gc,packs_before_gc,packs_after_gc
+50,25,off,0.025,0.001,0.003,4.2,4.2,4.2,0,0
+50,25,on,20.852,832.663,900.298,4.2,42.2,19.1,0,1
+200,25,off,0.026,0.001,0.002,16.4,16.4,16.4,0,0
+200,25,on,23.266,929.258,1567.409,16.4,142.8,34.4,0,1
