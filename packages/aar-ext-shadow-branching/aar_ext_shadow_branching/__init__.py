@@ -21,13 +21,15 @@ Implements the Shadow Branching Protocol:
     /revert N             Alias for ``/undo``.
     /branch [N]           Preserve the active shadow branch as
                           ``shadow/session-<id>-branch-<K>`` and start a fresh shadow
-                          from ``HEAD~N`` (or ``HEAD`` if no N given). Branch
+                          from N logical checkpoints back (or ``HEAD`` if no N given).
+                          ``shadow-meta`` commits are skipped when counting. Branch
                           numbering is derived from the branches that already
                           exist on disk, so it survives session reloads and
                           branch-of-branch chains.
-    /switch <branch>      Switch to any existing ``shadow/session-<id>*`` branch.
-                          Accepts bare branch names or the shorthand
-                          ``branch-<K>``. Refuses to switch with a dirty tree.
+    /switch <branch>      Switch to any existing branch in this session's exact
+                          ``shadow/session-<id>`` namespace. Accepts bare branch
+                          names or the shorthand ``branch-<K>``. Refuses to switch
+                          with a dirty tree.
     /branches             List every shadow/branch copy belonging to this
                           session and mark the active one, as a tree.
 
@@ -155,6 +157,48 @@ def _next_branch_n(session_id: str, cwd: str | Path | None = None) -> int:
         except ValueError:
             continue
     return max_n + 1
+
+
+def _branch_belongs_to_session(branch: str, session_id: str) -> bool:
+    """Return True for branches inside *session_id*'s exact namespace.
+
+    Use a boundary after the session ID instead of substring matching so IDs
+    like ``s1`` and ``s10`` cannot be confused.  The broader ``canonical-``
+    prefix also lets unknown shorthand targets report "branch does not exist"
+    instead of being misclassified as cross-session.
+    """
+    canonical = f"shadow/session-{session_id}"
+    return branch == canonical or branch.startswith(f"{canonical}-")
+
+
+def _checkpoint_boundary_ref(keep_checkpoints: int, branch: str = "HEAD") -> str | None:
+    """Resolve the commit representing a logical checkpoint boundary.
+
+    ``shadow-meta`` commits are intentionally invisible to user-facing checkpoint
+    counts.  Raw refs like ``HEAD~1`` are therefore wrong when a meta commit sits
+    at HEAD: they move by one git commit, not one logical checkpoint.  This
+    helper scans first-parent history and returns the last commit before the
+    next ``shadow-auto`` checkpoint after ``keep_checkpoints`` checkpoints,
+    preserving any meta commits that belong to the kept timeline.
+    """
+    rc, out, _ = _run_git("log", "--reverse", "--first-parent", "--format=%H%x00%s", branch)
+    if rc != 0 or not out:
+        return None
+
+    seen_checkpoints = 0
+    previous_hash: str | None = None
+    last_hash: str | None = None
+    for line in out.splitlines():
+        sha, sep, subject = line.partition("\x00")
+        if not sep:
+            continue
+        if subject.startswith("shadow-auto:"):
+            seen_checkpoints += 1
+            if seen_checkpoints > keep_checkpoints:
+                return previous_hash
+        previous_hash = sha
+        last_hash = sha
+    return last_hash
 
 
 def _read_anchor_base(branch: str, fallback: str, cwd: str | Path | None = None) -> str:
@@ -560,7 +604,11 @@ def register(api: Any) -> None:
         # session's work on top of the old session's WIP — mixing file state
         # from session A with conversation history from session B.
         # Fix: switch to the old shadow branch's recorded base first.
-        if current and current.startswith("shadow/session-") and session_id not in current:
+        if (
+            current
+            and current.startswith("shadow/session-")
+            and not _branch_belongs_to_session(current, session_id)
+        ):
             old_base = _read_anchor_base(current, "main")
             ctx.logger.warning(
                 "shadow-branching: repo is on %s (shadow branch of another session). "
@@ -790,7 +838,15 @@ def register(api: Any) -> None:
             )
             return "✗ uncommitted changes present — commit/stash or use --force"
 
-        rc, _, err = _run_git("reset", "--hard", f"HEAD~{n}")
+        keep_count = len(state.checkpoints) - n
+        target_ref = _checkpoint_boundary_ref(keep_count)
+        if not target_ref:
+            ctx.logger.warning(
+                "shadow-branching: cannot resolve checkpoint boundary for undo %d", n
+            )
+            return f"✗ cannot resolve checkpoint boundary for undo {n}"
+
+        rc, _, err = _run_git("reset", "--hard", target_ref)
         if rc != 0:
             ctx.logger.warning("shadow-branching: git reset failed: %s", err)
             return f"✗ git reset failed: {err}"
@@ -801,9 +857,24 @@ def register(api: Any) -> None:
         if dirty and force:
             _run_git("clean", "-fd")
 
-        removed = state.checkpoints[-n:]
-        state.checkpoints = state.checkpoints[:-n]
-        state.turn_counter = max(0, state.turn_counter - n)
+        removed = state.checkpoints[keep_count:]
+        state.checkpoints = state.checkpoints[:keep_count]
+        state.turn_counter = keep_count
+
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            reloaded = reload_session_from_disk(session, logger=ctx.logger)
+            if reloaded:
+                ctx.logger.info(
+                    "shadow-branching: session events reloaded after /undo (%d events)",
+                    len(session.events),
+                )
+            else:
+                ctx.logger.warning(
+                    "shadow-branching: could not reload session events after /undo — "
+                    "conversation history may include reverted work"
+                )
+
         sha = _short_hash("HEAD")
         ctx.logger.info(
             "shadow-branching: reverted %d checkpoint(s), now at %s (removed turns %s)",
@@ -877,8 +948,18 @@ def register(api: Any) -> None:
                 f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot branch {n} back"
             )
 
-        # Resolve branch point before rename so HEAD~N is still valid.
-        branch_ref = f"HEAD~{n}" if n else "HEAD"
+        # Resolve branch point before rename. ``shadow-meta`` commits are not
+        # logical checkpoints, so ``/branch N`` must count shadow-auto commits
+        # instead of using raw refs like HEAD~N.
+        if n:
+            branch_ref = _checkpoint_boundary_ref(len(state.checkpoints) - n)
+            if not branch_ref:
+                ctx.logger.warning(
+                    "shadow-branching: cannot resolve checkpoint boundary for branch %d", n
+                )
+                return f"✗ cannot resolve checkpoint boundary for branch {n}"
+        else:
+            branch_ref = "HEAD"
         rc, branch_sha, err = _run_git("rev-parse", branch_ref)
         if rc != 0:
             ctx.logger.warning(
@@ -992,7 +1073,9 @@ def register(api: Any) -> None:
             target = f"{canonical}-{target}"
 
         # ── Guard: never switch to a branch belonging to a different session ──
-        if target.startswith("shadow/session-") and state.session_id not in target:
+        if target.startswith("shadow/session-") and not _branch_belongs_to_session(
+            target, state.session_id
+        ):
             ctx.logger.warning(
                 "shadow-branching: refusing to switch to %s — it belongs to a different session. "
                 "Start a new aar session (or use --session) to work on that branch's session.",

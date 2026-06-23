@@ -214,6 +214,23 @@ def _write_and_checkpoint(
     _fire_tool_result(api, ctx, tool_name="write_file")
 
 
+def _save_real_session(repo: Path, ctx: FakeCtx, events: list[Any], step_count: int) -> None:
+    from agent.core.session import Session as RealSession
+    from agent.memory.session_store import SessionStore
+
+    ctx.session.events = list(events)
+    ctx.session.step_count = step_count
+    store = SessionStore(base_dir=repo / ".agent" / "sessions")
+    store.save(
+        RealSession(
+            session_id=ctx.session.session_id,
+            events=ctx.session.events,
+            step_count=step_count,
+            metadata=ctx.session.metadata,
+        )
+    )
+
+
 def test_tool_result_creates_checkpoint(session_api) -> None:
     api, ctx, repo = session_api
 
@@ -241,12 +258,10 @@ def test_session_end_commits_dirty_jsonl(session_api) -> None:
     (repo / "session.jsonl").write_text('{"session_id": "s1"}\n')
 
     # Verify it is actually dirty before session_end fires
-    rc, status, _ = (
-        subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True),
-        None,
-        None,
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
     )
-    assert rc.stdout.strip(), "Expected dirty tree before session_end"
+    assert status.stdout.strip(), "Expected dirty tree before session_end"
 
     _fire_session_end(api, ctx)
 
@@ -406,6 +421,70 @@ def test_undo_n_reverts_multiple(session_api) -> None:
     assert result is not None
     assert result.startswith("↩")
     assert "2 checkpoint" in result
+
+
+def test_undo_skips_shadow_meta_commits(session_api) -> None:
+    """/undo counts logical checkpoints, not raw commits at HEAD."""
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    (repo / "session.jsonl").write_text('{"after": "a"}\n', encoding="utf-8")
+    _fire_session_end(api, ctx)
+
+    _write_and_checkpoint(api, ctx, repo, "b.txt", "two")
+    (repo / "session.jsonl").write_text('{"after": "b"}\n', encoding="utf-8")
+    _fire_session_end(api, ctx)
+
+    result = _run_cmd(api, "undo", "1", ctx)
+
+    assert result is not None and result.startswith("↩")
+    assert (repo / "a.txt").exists()
+    assert not (repo / "b.txt").exists()
+    st = _session_state(ctx)
+    assert st["turn_counter"] == 1
+    assert len(st["checkpoints"]) == 1
+    log = _git("log", "--oneline", "-1", cwd=repo).stdout
+    assert "shadow-meta: session sync" in log
+
+
+def test_undo_reloads_session_events_to_reverted_checkpoint(repo: Path) -> None:
+    from agent.core.events import AssistantMessage, UserMessage
+
+    api = FakeAPI()
+    register(api)
+    session = FakeSession("undo_reload")
+    ctx = FakeCtx(session)
+    api.handlers["session_start"][0](None, ctx)
+
+    _write_and_checkpoint(api, ctx, repo, "first.txt", "one")
+    _save_real_session(
+        repo,
+        ctx,
+        [UserMessage(content="create first.txt"), AssistantMessage(content="created first.txt")],
+        1,
+    )
+
+    _write_and_checkpoint(api, ctx, repo, "second.txt", "two")
+    _save_real_session(
+        repo,
+        ctx,
+        [
+            UserMessage(content="create first.txt"),
+            AssistantMessage(content="created first.txt"),
+            UserMessage(content="create second.txt"),
+            AssistantMessage(content="created second.txt"),
+        ],
+        2,
+    )
+
+    result = _run_cmd(api, "undo", "1", ctx)
+
+    assert result is not None and result.startswith("↩")
+    assert (repo / "first.txt").exists()
+    assert not (repo / "second.txt").exists()
+    contents = " ".join(getattr(e, "content", "") or "" for e in ctx.session.events)
+    assert "first.txt" in contents
+    assert "second.txt" not in contents
+    assert ctx.session.step_count == 1
 
 
 def test_branch_auto_commits_pending(session_api, caplog: pytest.LogCaptureFixture) -> None:
@@ -701,6 +780,25 @@ def test_branch_back_n_rewinds(session_api) -> None:
     assert (repo / "a.txt").exists()
     assert (repo / "b.txt").exists()
     assert (repo / "c.txt").exists()
+
+
+def test_branch_back_n_skips_shadow_meta_commits(session_api) -> None:
+    """/branch N counts logical checkpoints even when meta commits are interleaved."""
+    api, ctx, repo = session_api
+    for filename, marker in (("a.txt", "a"), ("b.txt", "b"), ("c.txt", "c")):
+        _write_and_checkpoint(api, ctx, repo, filename, marker)
+        (repo / "session.jsonl").write_text(f'{{"after": "{marker}"}}\n', encoding="utf-8")
+        _fire_session_end(api, ctx)
+
+    result = _run_cmd(api, "branch", "1", ctx)
+
+    assert result is not None
+    assert "rewound 1 checkpoint" in result
+    assert (repo / "a.txt").exists()
+    assert (repo / "b.txt").exists()
+    assert not (repo / "c.txt").exists()
+    log = _git("log", "--oneline", "-1", cwd=repo).stdout
+    assert "shadow-meta: session sync" in log
 
 
 def test_branch_of_branch_of_branch_numbers_monotonically(session_api) -> None:
@@ -1216,6 +1314,28 @@ def test_session_start_stale_shadow_warning_logged(
     assert any("--session" in r.message for r in caplog.records)
 
 
+def test_session_start_uses_exact_session_branch_namespace(repo: Path) -> None:
+    """Session IDs with shared prefixes (s1 vs s10) must not be confused."""
+    api_old = FakeAPI()
+    register(api_old)
+    ctx_old = FakeCtx(FakeSession("s10"))
+    api_old.handlers["session_start"][0](None, ctx_old)
+
+    branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
+    assert branch_out == "shadow/session-s10"
+
+    api_new = FakeAPI()
+    register(api_new)
+    ctx_new = FakeCtx(FakeSession("s1"))
+    api_new.handlers["session_start"][0](None, ctx_new)
+
+    st = _session_state(ctx_new)
+    assert st["shadow_branch"] == "shadow/session-s1"
+    assert st["original_branch"] == "main"
+    log = _git("log", "--oneline", "--grep=shadow-init:", "shadow/session-s1", cwd=repo)
+    assert "base=main" in log.stdout
+
+
 def test_switch_rejects_cross_session_branch(repo: Path) -> None:
     """/switch must refuse to check out a branch belonging to a different session."""
     # Session A
@@ -1245,6 +1365,21 @@ def test_switch_rejects_cross_session_branch(repo: Path) -> None:
     # Confirm we're still on session B's branch
     branch_out = _git("branch", "--show-current", cwd=repo).stdout.strip()
     assert branch_out == "shadow/session-sess_b"
+
+
+def test_switch_uses_exact_session_branch_namespace(repo: Path) -> None:
+    api = FakeAPI()
+    register(api)
+    ctx = FakeCtx(FakeSession("s1"))
+    api.handlers["session_start"][0](None, ctx)
+
+    _git("branch", "shadow/session-s10", cwd=repo)
+
+    result = _run_cmd(api, "switch", "shadow/session-s10", ctx)
+
+    assert result is not None
+    assert "different session" in result
+    assert _git("branch", "--show-current", cwd=repo).stdout.strip() == "shadow/session-s1"
 
 
 def test_switch_allows_own_session_branches(repo: Path) -> None:
