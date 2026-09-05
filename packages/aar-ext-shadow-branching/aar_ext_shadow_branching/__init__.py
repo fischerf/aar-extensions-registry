@@ -10,8 +10,8 @@ Implements the Shadow Branching Protocol:
 * After every ``tool_result`` that leaves uncommitted changes — take a checkpoint
   commit ``shadow-auto: <tool_name> turn-<N>`` and log the
   ``[CHECKPOINT turn=N hash=... tool=...]`` trail.  Warns (before committing) if
-  the change set contains files that look sensitive (``.env*``, ``*.key``,
-  ``*credentials*``).
+  the change set contains files that look sensitive — the path (lower-cased)
+  containing any of ``.env``, ``.key``, ``credentials``, ``id_rsa``, ``secret``.
 
 * Slash commands (Aar surfaces these via the Slash-commands extension API in
   every transport):
@@ -32,6 +32,12 @@ Implements the Shadow Branching Protocol:
                           with a dirty tree.
     /branches             List every shadow/branch copy belonging to this
                           session and mark the active one, as a tree.
+    /done                 Squash-merge the active shadow branch back into the
+                          base branch captured in ``shadow-init``. Aborts cleanly
+                          on merge conflicts and names the files that need
+                          manual resolution. On success the extension *disarms*
+                          itself for the rest of the session (``mode="done"``) so
+                          that nothing is ever committed to the base branch.
 
 All state is also mirrored into ``session.metadata['shadow_branching']`` so the
 session JSONL store keeps a faithful record across resumes.
@@ -40,13 +46,6 @@ A ``before_turn`` hook commits any JSONL or other files written by the transport
 after the previous turn completed, keeping the working tree clean so that
 ``/branch``, ``/switch``, and ``/done`` are never blocked by a dirty tree caused
 purely by session bookkeeping.
-    /done                 Squash-merge the active shadow branch back into the
-                          base branch captured in ``shadow-init``. Aborts cleanly
-                          on merge conflicts and names the files that need
-                          manual resolution.
-
-All state is also mirrored into ``session.metadata['shadow_branching']`` so the
-session JSONL store keeps a faithful record across resumes.
 
 **Cross-session safety:** if the working directory is left on a shadow branch
 from a *previous* session (e.g. the user ran ``aar chat`` without ``--session``),
@@ -452,8 +451,16 @@ def register(api: Any) -> None:
             meta["shadow_branching"] = state.to_metadata()
         # Keep the module-level registry in sync so the SessionStore.save hook
         # can find the right state to sweep when save(session_id=...) fires.
+        # Only *enabled* states belong in the registry: a disabled state (no
+        # git repo / no identity, or a session retired by /done) must never
+        # cause the save hook to commit — after /done HEAD sits on the user's
+        # base branch, so a stale entry would land ``shadow-meta`` commits
+        # there.
         if state.session_id:
-            _active_states[state.session_id] = state
+            if state.enabled:
+                _active_states[state.session_id] = state
+            else:
+                _active_states.pop(state.session_id, None)
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
         """Count shadow-auto commits on *branch* and build a checkpoint list."""
@@ -532,6 +539,21 @@ def register(api: Any) -> None:
         )
         return True
 
+    def _disabled_reason() -> str:
+        """Why a command that needs an armed shadow branch cannot run.
+
+        ``mode == "done"`` is not a failure — the session was merged back on
+        purpose and the extension deliberately stepped aside — so it gets its
+        own wording instead of the generic "no git repo or identity".
+        Returned without a leading marker so it reads well in a log line too.
+        """
+        if state is not None and state.mode == "done":
+            return (
+                "session already merged via /done — "
+                "start a new session to continue with shadow branching"
+            )
+        return "shadow-branching disabled (no git repo or identity)"
+
     def _parse_int_arg(args: str) -> tuple[int | None, set[str]]:
         """Return (integer N or None, set of flag tokens like {'--force'})."""
         flags: set[str] = set()
@@ -564,6 +586,27 @@ def register(api: Any) -> None:
         # silently undo any ``/switch`` the user did between turns.
         # A lightweight metadata sync is enough to keep things in order.
         if state is not None and state.enabled and state.session_id == session_id:
+            _sync_metadata(ctx)
+            return
+
+        # ── Stay retired once /done has merged this session back ──────
+        # /done deliberately leaves shadow/session-<id> in place, so the
+        # "resume this exact session" path below would happily check it back
+        # out — reactivating a shadow branch on top of already-merged work and
+        # putting HEAD back on it. The persisted ``done`` marker covers both
+        # the in-process case (session_start fires once per user message) and a
+        # cold resume via ``--session <id>``.
+        prev = (getattr(getattr(ctx, "session", None), "metadata", None) or {}).get(
+            "shadow_branching"
+        ) or {}
+        if prev.get("mode") == "done":
+            ctx.logger.info(
+                "shadow-branching: session %s was already merged via /done — staying disabled",
+                session_id,
+            )
+            state = ShadowState.from_metadata(prev)
+            state.enabled = False
+            state.mode = "done"
             _sync_metadata(ctx)
             return
 
@@ -815,8 +858,9 @@ def register(api: Any) -> None:
 
     def _do_undo(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
-            ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return "✗ shadow-branching disabled (no git repo or identity)"
+            reason = _disabled_reason()
+            ctx.logger.warning("shadow-branching: %s", reason)
+            return f"✗ {reason}"
 
         n, flags = _parse_int_arg(args)
         n = n if n and n >= 1 else 1
@@ -906,8 +950,9 @@ def register(api: Any) -> None:
     def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
         if state is None or not state.enabled:
-            ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return "✗ shadow-branching disabled (no git repo or identity)"
+            reason = _disabled_reason()
+            ctx.logger.warning("shadow-branching: %s", reason)
+            return f"✗ {reason}"
 
         # Sweep up any session-store writes (JSONL etc.) that happened outside
         # of tool_result checkpoints so the working tree is clean before we
@@ -1039,8 +1084,9 @@ def register(api: Any) -> None:
     def cmd_switch(args: str, ctx: Any) -> str | None:
         nonlocal state
         if state is None or not state.enabled:
-            ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return "✗ shadow-branching disabled (no git repo or identity)"
+            reason = _disabled_reason()
+            ctx.logger.warning("shadow-branching: %s", reason)
+            return f"✗ {reason}"
 
         target = args.strip()
 
@@ -1180,8 +1226,9 @@ def register(api: Any) -> None:
     )
     def cmd_done(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
-            ctx.logger.warning("shadow-branching: disabled (no git repo or identity)")
-            return "✗ shadow-branching disabled (no git repo or identity)"
+            reason = _disabled_reason()
+            ctx.logger.warning("shadow-branching: %s", reason)
+            return f"✗ {reason}"
 
         # Sweep up session-store writes before checking for a clean tree.
         _auto_commit_pending(ctx, "pre-done sync")
@@ -1259,7 +1306,17 @@ def register(api: Any) -> None:
             base,
             sha,
         )
-        _sync_metadata(ctx)
+
+        # Disarm. HEAD is on the user's base branch now, so every hook that
+        # checks ``state.enabled`` — tool_result, before_turn, session_end and
+        # the SessionStore.save wrapper — must become a no-op. Otherwise the
+        # very next JSONL save would drop a ``shadow-meta`` commit, and the
+        # next tool call a raw ``shadow-auto`` checkpoint, straight onto the
+        # base branch. ``mode="done"`` is persisted in the metadata so a resume
+        # of this session (``--session <id>``) stays disarmed as well.
+        state.enabled = False
+        state.mode = "done"
+        _sync_metadata(ctx)  # pops the stale _active_states entry
         return f"✓ squashed {state.shadow_branch} → {base} as {sha}"
 
     # ------------------------------------------------------------------
@@ -1274,5 +1331,7 @@ def register(api: Any) -> None:
         "/switch <branch|branch-K>, /branches, /done. "
         "/switch only works within the current session's branches — to resume "
         "another session's work, restart aar with --session <id>. "
-        "Never commit directly to the user's base branch — work is merged back only on /done."
+        "Never commit directly to the user's base branch — work is merged back only on /done. "
+        "After a successful /done the extension retires itself for the rest of the session: "
+        "no further checkpoints are taken and the commands stop working until a new session."
     )

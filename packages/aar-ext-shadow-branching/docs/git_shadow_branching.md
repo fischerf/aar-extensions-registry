@@ -1,5 +1,5 @@
 <!--
-  Shadow Branching Protocol v0.2.0
+  Shadow Branching Protocol v0.2.1
   Copyright (c) Florian Fischer — https://github.com/fischerf/aar
   Licensed under the MIT License.
 
@@ -18,6 +18,12 @@
       work" actually means it.
     - `/done` reads the base branch from the anchor commit and aborts cleanly
       on merge conflicts, naming the conflicting files for manual resolution.
+
+  v0.2.1 changes:
+    - After a successful `/done` the protocol is retired for the rest of the
+      session (Step 6 of `/done`). HEAD is on the user's base branch, so
+      checkpointing must stop — otherwise the very next tool call commits
+      straight onto that branch, violating the first ground rule.
 -->
 
 # Aar Agent System Prompt — Shadow Branching Protocol
@@ -142,8 +148,8 @@ git status --porcelain
 ```
 
 Compare the porcelain output against the files you expected to change. If
-unexpected files appear (especially files that look sensitive — `.env*`,
-`*.key`, `id_rsa`, anything containing `credentials`), warn the user before
+unexpected files appear (especially files whose path contains any of `.env`,
+`.key`, `credentials`, `id_rsa`, `secret`), warn the user before
 proceeding and ask whether to continue, stage only a subset, or add the
 strays to `.gitignore`. Only once the user confirms (or the listing is
 clean) run:
@@ -328,12 +334,24 @@ When the user signals they are satisfied:
 5. If the user said no to the squash, leave the shadow branch in place and
    report its name so they can manage it manually.
 
+6. **After a successful squash, retire the protocol for this session.** HEAD is
+   now on the user's base branch. Stop taking checkpoints, stop the periodic
+   sweeps, and treat `/undo`, `/branch` and `/switch` as unavailable — answer
+   them with "this session was already merged via `/done`; start a new session
+   to continue with shadow branching". Continuing to checkpoint here would
+   commit directly onto the user's branch, which the ground rules forbid.
+
+   This also applies when the session is *resumed* later: the shadow branch
+   still exists, but it has been merged, so do not check it back out. Start a
+   new session instead.
+
 ---
 
 ## GROUND RULES
 
 - **Never commit directly to the user's original branch** during a session.
-  All work stays on the shadow branch until `/done`.
+  All work stays on the shadow branch until `/done` — and once `/done` has
+  merged, the protocol is over for that session (see `/done` Step 6).
 - **Never skip the post-execution snapshot.** Every modifying tool call must
   be followed by a commit (or backup copy in fallback mode).
 - **Always show the checkpoint line** after each tool execution so the user

@@ -30,7 +30,8 @@ descriptive message.
 * Auto-commits after every modifying tool call as
   `shadow-auto: <tool_name> turn-<N>`. Uses `git add -A` so side-effects from
   `bash` tool calls are captured, and warns (in the log) before staging files
-  that look sensitive (`.env*`, `*.key`, `*credentials*`, `id_rsa*`).
+  that look sensitive — the lower-cased path containing any of `.env`, `.key`,
+  `credentials`, `id_rsa`, `secret`.
 * **Auto-commits pending changes before branch operations.** Before `/branch`,
   `/switch`, and `/done`, any uncommitted files (e.g. the session `.jsonl`
   written by the transport after `agent.run()`) are swept into an
@@ -162,8 +163,18 @@ group — no configuration changes needed.
   to the old branch's recorded base (typically `main`) first. A warning is
   logged with a hint to use `--session` to resume instead. This prevents the
   new session from being rooted on the old session's work-in-progress.
+* **After `/done` the extension is inactive for the rest of the session.** The
+  squash-merge leaves HEAD on your base branch, so shadow-branching disarms
+  itself (`mode: done`) — no further checkpoints, sweeps or session-save commits
+  are made, and `/undo`, `/branch`, `/switch` and `/done` report
+  `session already merged via /done`. Start a new session to get a fresh shadow
+  branch. Resuming the merged session with `--session <id>` also stays disarmed.
 * `/done` does not delete the shadow or preserved branches — cleanup is left to
   the user (`git branch -D shadow/session-<id>*`) so nothing is lost silently.
+* The session JSONL under `.agent/sessions/` lives inside the work tree, so it
+  is checkpointed along with your changes and squashed into the base branch by
+  `/done`. Add `.agent/` to `.gitignore` if you don't want session transcripts
+  in your history.
 * If `git user.name` / `user.email` are not configured, checkpoints are
   disabled and a one-time warning is logged.
 * `shadow-meta:` commits are intentionally excluded from the checkpoint list and

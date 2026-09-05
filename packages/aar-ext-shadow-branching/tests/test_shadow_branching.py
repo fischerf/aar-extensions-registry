@@ -1199,6 +1199,118 @@ def test_done_no_message_uses_default(session_api) -> None:
     assert result.startswith("✓")
 
 
+def test_done_disarms_hooks_on_base_branch(session_api) -> None:
+    """After /done, HEAD is on the user's base branch — nothing may commit there.
+
+    Regression: /done merged correctly but left ``state.enabled`` True, so the
+    SessionStore.save hook, the before_turn / session_end sweeps and the next
+    tool_result all kept firing while HEAD sat on ``main``, dropping
+    ``shadow-meta:`` and ``shadow-auto:`` commits straight onto the user's
+    branch — the exact thing the extension promises never to do.
+    """
+    from agent.core.session import Session
+    from agent.core.state import AgentState
+    from agent.memory.session_store import SessionStore
+
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+
+    result = _run_cmd(api, "done", "finishing up", ctx)
+    assert result is not None and result.startswith("✓")
+
+    # Now simulate everything that normally happens after the command returns:
+    # the transport saving the JSONL, and the agent doing more work.
+    store = SessionStore(base_dir=repo / ".agent" / "sessions")
+    store.save(
+        Session(
+            session_id="s1",
+            run_id="r1",
+            trace_id="t1",
+            state=AgentState.COMPLETED,
+            step_count=1,
+            metadata={},
+            events=[],
+        )
+    )
+    _fire_before_turn(api, ctx)
+    (repo / "b.txt").write_text("two", encoding="utf-8")
+    _fire_tool_result(api, ctx)
+    _fire_session_end(api, ctx)
+
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
+    ).stdout
+
+    assert current == "main"
+    assert "shadow-auto:" not in log
+    assert "shadow-meta:" not in log
+    assert len(log.strip().splitlines()) == 2, (
+        f"only 'initial' + the squash commit expected on main, got:\n{log}"
+    )
+
+    # The post-/done work is still there in the tree, just uncommitted — the
+    # extension stepped aside rather than swallowing it.
+    status = _git("status", "--porcelain", cwd=repo).stdout
+    assert "b.txt" in status
+
+    # Subsequent commands explain the state instead of failing generically.
+    assert "already merged" in (_run_cmd(api, "undo", "", ctx) or "")
+    assert "already merged" in (_run_cmd(api, "branch", "", ctx) or "")
+    assert "already merged" in (_run_cmd(api, "switch", "main", ctx) or "")
+    assert "already merged" in (_run_cmd(api, "done", "", ctx) or "")
+
+    assert _session_state(ctx)["mode"] == "done"
+    assert _session_state(ctx)["enabled"] is False
+
+
+def test_session_start_after_done_stays_disabled(repo: Path) -> None:
+    """Resuming a session that was merged via /done must not re-arm it.
+
+    /done deliberately keeps ``shadow/session-<id>`` around, so the resume path
+    would otherwise check that branch back out and continue committing on top
+    of work that is already merged.
+    """
+    api1 = FakeAPI()
+    register(api1)
+    ctx1 = FakeCtx(FakeSession("done1"))
+    api1.handlers["session_start"][0](None, ctx1)
+
+    (repo / "a.txt").write_text("one", encoding="utf-8")
+    _fire_tool_result(api1, ctx1, tool_name="write_file")
+    assert (_run_cmd(api1, "done", "merge it", ctx1) or "").startswith("✓")
+
+    persisted = dict(_session_state(ctx1))
+    assert persisted["mode"] == "done"
+    # The shadow branch is intentionally left behind — that is the hazard.
+    assert "shadow/session-done1" in _list_branches("shadow/session-done1*", cwd=repo)
+
+    # Cold resume: fresh register(), same session id, metadata loaded from disk.
+    api2 = FakeAPI()
+    register(api2)
+    session2 = FakeSession("done1")
+    session2.metadata["shadow_branching"] = persisted
+    ctx2 = FakeCtx(session2)
+    api2.handlers["session_start"][0](None, ctx2)
+
+    current = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert current == "main", "resume must not check the merged shadow branch back out"
+    assert _session_state(ctx2)["enabled"] is False
+    assert _session_state(ctx2)["mode"] == "done"
+
+    # And the hooks stay quiet on the base branch.
+    (repo / "b.txt").write_text("two", encoding="utf-8")
+    _fire_tool_result(api2, ctx2)
+    _fire_session_end(api2, ctx2)
+    log = _git("log", "--oneline", cwd=repo).stdout
+    assert "shadow-auto:" not in log
+    assert "shadow-meta:" not in log
+
+
 # ---------------------------------------------------------------------------
 # Session resume — metadata + branch reconstruction
 # ---------------------------------------------------------------------------
