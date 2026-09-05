@@ -147,6 +147,53 @@ group — no configuration changes needed.
 
 ---
 
+## TUI panel (`aar tui --fixed`, ctrl+b)
+
+Since 0.3.0 the extension registers a **UI panel** (Aar's `UIPanel` contract,
+`agent.extensions.api`). In the fixed TUI press `ctrl+b` to open it in the
+right column; it shows the session's git shadow tree and runs every operation
+without typing slash commands:
+
+```
+⎇ Shadow
+session a1b2
+├─ main @ 3f9c1e2
+├─ shadow/session-a1b2  ● active
+│  ├─ e71a9d0  turn  7  edit_file ●
+│  ├─ b02c4f1  turn  6  bash
+│  ├─ 9a8d33c  turn  5  write_file ⚠
+│  └─ …
+├─ shadow/session-a1b2-branch-1  (4 cp)
+└─ 2 modified · 1 untracked (pending)
+───────────────────────────────────────
+[u] undo to here  [b] fork here  [d] diff  [r] refresh  [D] squash → base
+```
+
+| Key | Node | Action |
+|-----|------|--------|
+| `u` | checkpoint | `/undo` back to that checkpoint (confirm; `f` in the dialog = `--force`). Disabled on the tip. |
+| `b` | checkpoint / active branch | `/branch N` from that checkpoint, or `/branch` from HEAD |
+| `s` | branch | `/switch` to that branch |
+| `d` | checkpoint | `git show --stat` for the checkpoint (read-only) |
+| `x` | branch | `git branch -D` (confirm). Refuses the active shadow and the base branch. |
+| `D` | root / base / branch | `/done --yes` with the message typed in the dialog (confirm) |
+| `r` | any | re-read the tree |
+
+* Newest checkpoint on top; `●` marks the tip, `⚠` a checkpoint that touched a
+  sensitive-looking path, `(N cp)` a collapsed branch.
+* Action keys only work while the panel has focus (`ctrl+b` toggles focus,
+  `esc` hides). Mutating actions are refused while the agent is running;
+  `diff` / `refresh` stay available.
+* Every action prints the same result line the slash command would, and the
+  transcript is re-rendered after `undo` / `switch` / `branch`.
+* After `/done` the panel shows *Shadow branching inactive*.
+* The header shows a chip `⎇ session-<id> · N cp` while the panel is armed.
+
+The same tree and actions are available to editors over ACP stdio
+(`_aar/panel_list`, `_aar/panel_snapshot`, `_aar/panel_action`,
+`_aar/panel_changed`) — see `docs/acp.md` in the Aar repo. On an Aar core that
+predates the panel contract the extension still loads with slash commands only.
+
 ## Notes
 
 * The extension operates on the working directory. Use Aar's default project

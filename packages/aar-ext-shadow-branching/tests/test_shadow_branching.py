@@ -34,6 +34,7 @@ class FakeAPI:
         self.handlers: dict[str, list[Callable]] = {}
         self.commands: dict[str, tuple[str, Callable]] = {}
         self.system_prompt_parts: list[str] = []
+        self.panels: list[Any] = []
 
     def on(self, event: str) -> Callable:
         def deco(fn: Callable) -> Callable:
@@ -57,6 +58,9 @@ class FakeAPI:
 
     def append_system_prompt(self, text: str) -> None:
         self.system_prompt_parts.append(text)
+
+    def register_panel(self, panel: Any) -> None:
+        self.panels.append(panel)
 
 
 class FakeSession:

@@ -57,6 +57,7 @@ rejected with a descriptive message.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -66,6 +67,15 @@ from typing import Any
 __all__ = ["register", "ShadowState", "reload_session_from_disk"]
 
 _module_logger = logging.getLogger("aar_ext_shadow_branching")
+
+# UI panel contract (fixed TUI ``ctrl+b`` / ACP ``_aar/panel_*``).  Optional:
+# on a core without it the extension still loads with slash commands only.
+try:
+    from agent.extensions.api import UIAction, UIInvocation, UINode, UIPanel
+
+    _HAS_PANEL_API = True
+except ImportError:  # pragma: no cover — older core
+    _HAS_PANEL_API = False
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +242,39 @@ def _flag_sensitive(status_output: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Panel support — change signalling + per-checkpoint details
+# ---------------------------------------------------------------------------
+
+# session_id -> the registered panel's ``changed`` event.  Lets the module-level
+# SessionStore.save hook (which has no access to the register() closure) wake
+# the panel after it commits.
+_panel_events: dict[str, asyncio.Event] = {}
+
+
+def _mark_panel_changed(session_id: str) -> None:
+    ev = _panel_events.get(session_id)
+    if ev is not None:
+        ev.set()
+
+
+# sha -> (files touched, looks sensitive).  Checkpoints made in this process
+# record these at commit time; ones reconstructed from ``git log`` on resume
+# (or on a sibling branch) are backfilled here, one ``git show`` per SHA.
+_details_cache: dict[str, tuple[int, bool]] = {}
+
+
+def _checkpoint_details(sha: str, cwd: str | Path | None = None) -> tuple[int, bool]:
+    cached = _details_cache.get(sha)
+    if cached is not None:
+        return cached
+    rc, out, _ = _run_git("show", "--name-only", "--format=", sha, cwd=cwd)
+    files = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+    flagged = any(any(n in f.lower() for n in _SENSITIVE_NEEDLES) for f in files)
+    _details_cache[sha] = (len(files), flagged)
+    return _details_cache[sha]
+
+
+# ---------------------------------------------------------------------------
 # State model — mirrored into session.metadata for save/load consistency
 # ---------------------------------------------------------------------------
 
@@ -339,9 +382,11 @@ def _install_save_hook() -> None:
 
     def save_with_shadow_commit(self: Any, session: Any) -> Any:
         path = original_save(self, session)
-        state = _active_states.get(getattr(session, "session_id", ""))
+        sid = getattr(session, "session_id", "")
+        state = _active_states.get(sid)
         if state is not None and state.enabled:
-            _commit_pending("session-saved", logger=_module_logger)
+            if _commit_pending("session-saved", logger=_module_logger):
+                _mark_panel_changed(sid)
         return path
 
     save_with_shadow_commit._shadow_branching_wrapped = True  # type: ignore[attr-defined]
@@ -435,6 +480,9 @@ def register(api: Any) -> None:
     _install_save_hook()
 
     state: ShadowState | None = None
+    # The UIPanel, once registered at the bottom of register(); ``_sync_metadata``
+    # closes over this name so every state change wakes the panel.
+    panel: Any = None
 
     # ------------------------------------------------------------------
     # Helpers (close over ``state`` and ``ctx``)
@@ -461,6 +509,12 @@ def register(api: Any) -> None:
                 _active_states[state.session_id] = state
             else:
                 _active_states.pop(state.session_id, None)
+        # Every state mutation ends here, so this is the one place to tell the
+        # panel (fixed TUI / ACP) that its tree is stale.
+        if panel is not None:
+            if state.session_id:
+                _panel_events[state.session_id] = panel.changed
+            panel.changed.set()
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
         """Count shadow-auto commits on *branch* and build a checkpoint list."""
@@ -800,9 +854,13 @@ def register(api: Any) -> None:
         tool_name = str(getattr(event, "tool_name", "") or "tool")
 
         # Warn about sensitive files before committing (Improvement 2).
+        files_touched = 0
+        flagged_any = False
         rc, status_out, _ = _run_git("status", "--porcelain")
         if rc == 0 and status_out:
+            files_touched = sum(1 for ln in status_out.splitlines() if len(ln) >= 4)
             flagged = _flag_sensitive(status_out)
+            flagged_any = bool(flagged)
             if flagged:
                 ctx.logger.warning(
                     "shadow-branching: committing files that look sensitive: %s",
@@ -843,7 +901,16 @@ def register(api: Any) -> None:
             return
 
         sha = _short_hash("HEAD")
-        state.checkpoints.append({"turn": state.turn_counter, "hash": sha, "tool": tool_name})
+        state.checkpoints.append(
+            {
+                "turn": state.turn_counter,
+                "hash": sha,
+                "tool": tool_name,
+                "files": files_touched,
+                "flagged": flagged_any,
+            }
+        )
+        _details_cache[sha] = (files_touched, flagged_any)
         ctx.logger.info(
             "[CHECKPOINT turn=%d hash=%s tool=%s]",
             state.turn_counter,
@@ -1318,6 +1385,290 @@ def register(api: Any) -> None:
         state.mode = "done"
         _sync_metadata(ctx)  # pops the stale _active_states entry
         return f"✓ squashed {state.shadow_branch} → {base} as {sha}"
+
+    # ------------------------------------------------------------------
+    # UI panel — base → shadow branch → checkpoints, sibling branches,
+    # pending changes; actions are thin wrappers over the slash commands.
+    # Rendered by the fixed TUI (ctrl+b) and served over ACP (_aar/panel_*).
+    # ------------------------------------------------------------------
+
+    if _HAS_PANEL_API:
+        # branch -> (tip sha, checkpoints).  Sibling branches don't move
+        # unless the user switches to them, so the tip SHA is a safe key.
+        _branch_ckpt_cache: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+
+        def _checkpoints_of(branch: str) -> list[dict[str, Any]]:
+            tip = _short_hash(branch)
+            cached = _branch_ckpt_cache.get(branch)
+            if cached is not None and cached[0] == tip:
+                return cached[1]
+            _, ckpts = _reconstruct_from_branch(branch)
+            _branch_ckpt_cache[branch] = (tip, ckpts)
+            return ckpts
+
+        def _cp_node(cp: dict[str, Any], idx: int, total: int, on_active: bool) -> UINode:
+            files = cp.get("files")
+            flagged = cp.get("flagged")
+            if files is None or flagged is None:
+                files, flagged = _checkpoint_details(cp["hash"])
+            is_tip = idx == total - 1
+            suffix = (" ⚠" if flagged else "") + (" ●" if on_active and is_tip else "")
+            style = "warn" if flagged else ("active" if on_active and is_tip else "")
+            return UINode(
+                id=f"cp:{cp['hash']}",
+                label=f"{cp['hash']}  turn {cp['turn']:>2}  {cp['tool']}{suffix}",
+                kind="checkpoint",
+                style=style,
+                data={
+                    "hash": cp["hash"],
+                    "turn": cp["turn"],
+                    "tool": cp["tool"],
+                    "files": files,
+                    "flagged": flagged,
+                    # "to here" == drop everything after this checkpoint.
+                    # /undo N and /branch N count back from the tip, so the
+                    # tip itself is 0 — the undo action refuses that.
+                    "n_back": total - 1 - idx,
+                    "active_branch": on_active,
+                },
+            )
+
+        def _pending_summary() -> str:
+            rc, out, _ = _run_git("status", "--porcelain")
+            if rc != 0 or not out:
+                return ""
+            modified = untracked = 0
+            for line in out.splitlines():
+                if line.startswith("??"):
+                    untracked += 1
+                else:
+                    modified += 1
+            parts = []
+            if modified:
+                parts.append(f"{modified} modified")
+            if untracked:
+                parts.append(f"{untracked} untracked")
+            return " · ".join(parts) + " (pending)"
+
+        def _snapshot(ctx: Any) -> UINode:
+            st = state
+            if st is None:
+                return UINode(
+                    "root",
+                    "Shadow branching",
+                    "root",
+                    children=[UINode("inactive", "not initialised", "info", style="dim")],
+                )
+            if st.mode == "done":
+                return UINode(
+                    "root",
+                    f"session {st.session_id}",
+                    "root",
+                    children=[
+                        UINode("inactive", "Shadow branching inactive", "info", style="dim"),
+                        UINode(
+                            "inactive-hint",
+                            "(merged via /done — start a new session for a fresh shadow branch)",
+                            "info",
+                            style="dim",
+                        ),
+                    ],
+                    data={"session_id": st.session_id, "mode": "done"},
+                )
+            if not st.enabled:
+                return UINode(
+                    "root",
+                    f"session {st.session_id}",
+                    "root",
+                    children=[
+                        UINode(
+                            "inactive",
+                            "Shadow branching inactive (no git repo or identity)",
+                            "info",
+                            style="dim",
+                        )
+                    ],
+                    data={"session_id": st.session_id, "mode": st.mode},
+                )
+
+            ckpts = st.checkpoints
+            active = UINode(
+                id=f"br:{st.shadow_branch}",
+                label=f"{st.shadow_branch}  ● active",
+                kind="branch",
+                style="active",
+                data={"name": st.shadow_branch, "active": True, "checkpoints": len(ckpts)},
+                # newest first
+                children=[_cp_node(c, i, len(ckpts), True) for i, c in enumerate(ckpts)][::-1],
+            )
+            siblings: list[UINode] = []
+            for b in _list_branches(f"shadow/session-{st.session_id}*"):
+                if b == st.shadow_branch:
+                    continue
+                cps = _checkpoints_of(b)
+                siblings.append(
+                    UINode(
+                        id=f"br:{b}",
+                        label=f"{b}  ({len(cps)} cp)",
+                        kind="branch",
+                        expanded=False,
+                        data={"name": b, "active": False, "checkpoints": len(cps)},
+                        children=[_cp_node(c, i, len(cps), False) for i, c in enumerate(cps)][::-1],
+                    )
+                )
+            base = UINode(
+                id="base",
+                label=f"{st.original_branch} @ {st.base_anchor}",
+                kind="base",
+                data={"name": st.original_branch, "anchor": st.base_anchor},
+            )
+            pending = _pending_summary()
+            return UINode(
+                "root",
+                f"session {st.session_id}",
+                "root",
+                children=[
+                    base,
+                    active,
+                    *siblings,
+                    UINode(
+                        "pending",
+                        pending or "working tree clean",
+                        "info",
+                        style="warn" if pending else "dim",
+                    ),
+                ],
+                data={"session_id": st.session_id, "mode": st.mode},
+            )
+
+        # -- actions: reuse the slash-command implementations -------------
+
+        def _act_undo(inv: UIInvocation) -> str | None:
+            if not inv.node.data.get("active_branch", True):
+                return "✗ undo only applies to the active shadow branch — switch to it first"
+            n = int(inv.node.data.get("n_back", 0))
+            if n <= 0:
+                return "• already at this checkpoint — nothing to undo"
+            args = f"{n} --force" if inv.args.get("force") else str(n)
+            return _do_undo(args, inv.ctx)
+
+        def _act_branch(inv: UIInvocation) -> str | None:
+            if inv.node.kind == "checkpoint":
+                if not inv.node.data.get("active_branch", True):
+                    return "✗ fork from the active shadow branch — switch to it first"
+                n = int(inv.node.data.get("n_back", 0))
+                return cmd_branch(str(n) if n > 0 else "", inv.ctx)
+            if not inv.node.data.get("active", False):
+                return "✗ switch to that branch first, then fork"
+            return cmd_branch("", inv.ctx)
+
+        def _act_switch(inv: UIInvocation) -> str | None:
+            if inv.node.data.get("active"):
+                return "• already on this branch"
+            return cmd_switch(str(inv.node.data.get("name", "")), inv.ctx)
+
+        def _act_diff(inv: UIInvocation) -> str | None:
+            sha = str(inv.node.data.get("hash", ""))
+            rc, out, err = _run_git("show", "--stat", "--format=%h %s", sha)
+            if rc != 0:
+                return f"✗ git show failed: {err or '(no output)'}"
+            return out or "(no changes)"
+
+        def _act_delete(inv: UIInvocation) -> str | None:
+            st = state
+            name = str(inv.node.data.get("name", ""))
+            if st is None or not st.enabled:
+                return "✗ shadow-branching disabled"
+            if inv.node.kind == "base" or name == st.original_branch:
+                return "✗ refusing to delete the base branch"
+            if inv.node.data.get("active") or name == st.shadow_branch:
+                return "✗ refusing to delete the active shadow branch"
+            if not _branch_belongs_to_session(name, st.session_id):
+                return f"✗ {name} does not belong to this session"
+            rc, _, err = _run_git("branch", "-D", name)
+            _branch_ckpt_cache.pop(name, None)
+            if rc != 0:
+                return f"✗ cannot delete {name}: {err}"
+            inv.ctx.logger.info("shadow-branching: deleted %s via panel", name)
+            _sync_metadata(inv.ctx)
+            return f"✓ deleted {name}"
+
+        def _act_done(inv: UIInvocation) -> str | None:
+            # The confirm dialog *is* the "--yes" for preserved branches.
+            message = str(inv.args.get("message", "") or "").strip()
+            return cmd_done(f"--yes {message}".strip(), inv.ctx)
+
+        def _act_refresh(inv: UIInvocation) -> str | None:
+            _branch_ckpt_cache.clear()
+            return None
+
+        def _status(ctx: Any) -> str:
+            st = state
+            if st is None or not st.enabled:
+                return ""
+            return f"⎇ {st.shadow_branch.split('/')[-1]} · {len(st.checkpoints)} cp"
+
+        panel = UIPanel(
+            name="shadow_branching",
+            title="⎇ Shadow",
+            snapshot=_snapshot,
+            status=_status,
+            actions=[
+                UIAction(
+                    "undo",
+                    "undo to here",
+                    "u",
+                    ("checkpoint",),
+                    _act_undo,
+                    destructive=True,
+                    confirm=(
+                        "Reset the shadow branch to {label}?\n"
+                        "Later checkpoints are dropped (they stay reachable in git reflog)."
+                    ),
+                    inputs=("force",),
+                ),
+                UIAction("branch", "fork here", "b", ("checkpoint", "branch"), _act_branch),
+                UIAction("switch", "switch", "s", ("branch",), _act_switch),
+                UIAction("diff", "diff", "d", ("checkpoint",), _act_diff, mutates=False),
+                UIAction(
+                    "delete",
+                    "delete",
+                    "x",
+                    ("branch",),
+                    _act_delete,
+                    destructive=True,
+                    confirm="Delete {label}? The branch is only recoverable via git reflog.",
+                ),
+                UIAction(
+                    "done",
+                    "squash → base",
+                    "D",
+                    ("root", "base", "branch"),
+                    _act_done,
+                    destructive=True,
+                    confirm=(
+                        "Squash the active shadow branch into its base branch and leave "
+                        "shadow mode for this session?"
+                    ),
+                    inputs=("message",),
+                ),
+                UIAction(
+                    "refresh",
+                    "refresh",
+                    "r",
+                    ("root", "base", "branch", "checkpoint", "info"),
+                    _act_refresh,
+                    mutates=False,
+                ),
+            ],
+        )
+        # Hosts that predate panels (or minimal test doubles) simply don't
+        # expose ``register_panel`` — the extension keeps its slash commands.
+        register_panel = getattr(api, "register_panel", None)
+        if callable(register_panel):
+            register_panel(panel)
+        else:
+            panel = None
 
     # ------------------------------------------------------------------
     # System prompt additions
