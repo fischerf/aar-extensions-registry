@@ -1,0 +1,15 @@
+{
+  "url": "http://127.0.0.1:8770",
+  "autostart": "off",
+  "python": "~/.aar/laya/.venv/Scripts/python.exe",
+  "model": "convaiinnovations/laya",
+  "threads": 0,
+  "max_questions": 16,
+  "idle_timeout": 1800,
+  "startup_timeout": 600,
+  "request_timeout": 120,
+  "log_file": "~/.aar/laya/server.log",
+  "tools": ["laya_decide", "laya_triage", "laya_guard"],
+  "gate": false,
+  "gate_threshold": 0.85
+}

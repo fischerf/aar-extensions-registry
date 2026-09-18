@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-laya"
+version = "0.1.0"
+description = "Local CPU decision tools (typed questions, calibrated probabilities) backed by the Laya System-1 model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aar-agent", "httpx>=0.28"]
+keywords = ["aar-extension", "laya", "classification", "routing", "decisions", "tool"]
+license = { text = "Apache-2.0" }
+
+[project.optional-dependencies]
+# Installed into the *server* venv, not into aar's environment.
+# CPU-only: install torch from the CPU index first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+server = [
+  "laya>=0.1.5,<0.2",
+  "torch>=2.0",
+  "transformers>=4.45",
+  "fastapi",
+  "uvicorn",
+  "pydantic>=2",
+]
+test = ["pytest", "pytest-asyncio", "fastapi"]
+
+[project.urls]
+"Home" = "https://github.com/fischerf/aar"
+"Repository" = "https://github.com/fischerf/aar-extensions-registry"
+"Model" = "https://huggingface.co/convaiinnovations/laya"
+
+[project.entry-points."aar_extensions"]
+laya = "aar_ext_laya:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_laya"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

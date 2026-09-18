@@ -1,7 +1,7 @@
 {
   "": "./schema/extensions.schema.json",
   "version": "1.0.0",
-  "updated": "2026-09-17",
+  "updated": "2026-09-18",
   "extensions": [
     {
       "name": "permission-gate",
@@ -84,6 +84,16 @@
       "repository": "https://github.com/fischerf/aar-extensions-registry",
       "homepage": "https://huggingface.co/AlexWortega/openjev",
       "status": "published"
+    },
+    {
+      "name": "laya",
+      "pypi": "aar-ext-laya",
+      "description": "Local CPU decision tools (typed questions, calibrated probabilities) backed by the Laya System-1 model — classify, route, triage and screen untrusted text",
+      "tags": ["tool", "safety"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "homepage": "https://huggingface.co/convaiinnovations/laya",
+      "status": "planned"
     },
     {
       "name": "companion",
