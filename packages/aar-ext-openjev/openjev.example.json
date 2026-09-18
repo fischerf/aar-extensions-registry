@@ -1,0 +1,17 @@
+{
+  "url": "http://127.0.0.1:8765",
+  "autostart": "off",
+  "python": "~/.aar/openjev/.venv/Scripts/python.exe",
+  "model": "AlexWortega/openjev",
+  "subfolder": "qwen3.5-4b-nli",
+  "bits": 4,
+  "device": "cuda:0",
+  "cuda_visible_devices": null,
+  "max_length": 2048,
+  "batch_size": 4,
+  "idle_timeout": 1800,
+  "startup_timeout": 240,
+  "request_timeout": 120,
+  "log_file": "~/.aar/openjev/server.log",
+  "tools": ["nli_check", "nli_rerank", "nli_grade"]
+}

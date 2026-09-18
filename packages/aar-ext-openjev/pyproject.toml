@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-openjev"
+version = "0.1.0"
+description = "Local NLI verification tools (claim checking, answer reranking, grading) backed by the openjev cross-encoder"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aar-agent", "httpx>=0.28"]
+keywords = ["aar-extension", "nli", "verification", "reranking", "tool"]
+license = { text = "Apache-2.0" }
+
+[project.optional-dependencies]
+# Installed into the *server* venv, not into aar's environment.
+# Install torch from the CUDA index first, e.g. --index-url https://download.pytorch.org/whl/cu128
+server = [
+  "torch>=2.6",
+  "transformers>=5.15",
+  "accelerate",
+  "bitsandbytes>=0.45",
+  "fastapi",
+  "uvicorn",
+]
+test = ["pytest", "pytest-asyncio", "fastapi"]
+
+[project.urls]
+"Home" = "https://github.com/fischerf/aar"
+"Repository" = "https://github.com/fischerf/aar-extensions-registry"
+"Model" = "https://huggingface.co/AlexWortega/openjev"
+
+[project.entry-points."aar_extensions"]
+openjev = "aar_ext_openjev:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_openjev"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

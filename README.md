@@ -16,6 +16,7 @@ Curated registry and first-party extension packages for the [Aar](https://github
       aar-ext-git-checkpoint/    - auto-commit at turn boundaries
       aar-ext-mcp-tools/         - MCP server tool discovery via extension API
       aar-ext-observability/     - structured metrics per turn
+      aar-ext-openjev/           - local NLI verification tools (openjev cross-encoder)
 
 ## First-Party Extensions
 
@@ -26,6 +27,7 @@ Curated registry and first-party extension packages for the [Aar](https://github
 | [aar-ext-git-checkpoint](packages/aar-ext-git-checkpoint/) | Auto-commit at turn boundaries + rollback tool | Ready |
 | [aar-ext-mcp-tools](packages/aar-ext-mcp-tools/) | MCP server tool discovery via extension API | Reference |
 | [aar-ext-observability](packages/aar-ext-observability/) | Structured metrics/logging per turn | Ready |
+| [aar-ext-openjev](packages/aar-ext-openjev/) | Local NLI tools: verify claims, rerank and grade answers (openjev, 4-bit on a spare GPU) | Ready |
 
 Each package has its own pyproject.toml, source, README, and tests.
 

@@ -1,7 +1,7 @@
 {
   "": "./schema/extensions.schema.json",
   "version": "1.0.0",
-  "updated": "2025-07-17",
+  "updated": "2026-09-17",
   "extensions": [
     {
       "name": "permission-gate",
@@ -73,6 +73,16 @@
       "tags": ["git", "safety"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "status": "published"
+    },
+    {
+      "name": "openjev",
+      "pypi": "aar-ext-openjev",
+      "description": "Local NLI verification tools (claim checking, answer reranking, grading) backed by the openjev Qwen3.5-4B cross-encoder on a spare GPU",
+      "tags": ["tool", "safety"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "homepage": "https://huggingface.co/AlexWortega/openjev",
       "status": "published"
     },
     {
