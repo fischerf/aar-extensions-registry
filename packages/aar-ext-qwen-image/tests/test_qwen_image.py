@@ -713,3 +713,47 @@ async def test_oversized_request_is_still_rejected(tmp_path: Path) -> None:
     out = await api.tools["image_generate"](prompt="x", width=4096, height=4096)
     assert "exceeds" in out
     assert not server.requests  # never reached the server
+
+
+# ---------------------------------------------------------------------------
+# Reference paths a model realistically produces
+# ---------------------------------------------------------------------------
+
+
+async def test_image_edit_accepts_at_prefixed_path(tmp_path: Path) -> None:
+    """`@path` is aar's attachment syntax; models copy it through verbatim."""
+    ref = tmp_path / "neon.png"
+    ref.write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+
+    out = await api.tools["image_edit"](prompt="make it snowy", images=[f"@{ref}"])
+    assert "not found" not in out
+    _, body = server.requests[0]
+    assert body["images"] == [PNG_B64]
+
+
+async def test_image_edit_resolves_bare_name_against_out_dir(tmp_path: Path) -> None:
+    """image_generate saves bare names into out_dir, so edits must find them there."""
+    ref = tmp_path / "neon.png"
+    ref.write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+
+    out = await api.tools["image_edit"](prompt="make it snowy", images=["neon.png"])
+    assert "not found" not in out
+    _, body = server.requests[0]
+    assert body["images"] == [PNG_B64]
+
+
+async def test_image_edit_still_reports_a_genuinely_missing_file(tmp_path: Path) -> None:
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    out = await api.tools["image_edit"](prompt="x", images=["@nope.png"])
+    assert "not found" in out
+    assert not server.requests
+
+
+def test_read_input_image_rejects_empty_after_stripping_at(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="empty reference image path"):
+        read_input_image("@", tmp_path)

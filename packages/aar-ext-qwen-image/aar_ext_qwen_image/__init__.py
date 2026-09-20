@@ -443,9 +443,27 @@ def resolve_out_path(out_dir: Path, name: str | None) -> Path:
     return path
 
 
-def read_input_image(raw: str) -> str:
-    """Read an image file from disk and return it base64-encoded."""
-    path = Path(raw).expanduser()
+def read_input_image(raw: str, out_dir: Path | None = None) -> str:
+    """Read an image file from disk and return it base64-encoded.
+
+    Accepts the two forms a model realistically produces besides a full path:
+
+    * ``@path`` — aar's own attachment syntax.  When the user writes
+      ``@~/pics/a.png`` the model tends to copy the ``@`` through verbatim.
+    * a bare file name — ``image_generate`` saves to *out_dir* under a bare
+      name, so the model refers back to its own output the same way.
+    """
+    candidate = raw.strip()
+    if candidate.startswith("@"):
+        candidate = candidate[1:].strip()
+    if not candidate:
+        raise ValueError(f"empty reference image path: {raw!r}")
+
+    path = Path(candidate).expanduser()
+    if not path.is_file() and out_dir is not None and Path(candidate).name == candidate:
+        in_out_dir = out_dir / candidate
+        if in_out_dir.is_file():
+            path = in_out_dir
     if not path.is_file():
         raise ValueError(f"reference image not found: {path}")
     if path.suffix.lower() not in INPUT_SUFFIXES:
@@ -642,7 +660,12 @@ def register(
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": MAX_REF_IMAGES,
-                        "description": "Paths of the reference images to edit",
+                        "description": (
+                            "Paths of the reference images to edit. If the user referred to "
+                            "an image as '@some/path.png', pass 'some/path.png' here — that "
+                            "attachment is what they want edited. To edit a picture you just "
+                            "made, pass the file name you saved it as."
+                        ),
                     },
                     **_COMMON_PROPS,
                 },
@@ -665,7 +688,7 @@ def register(
                 return f"qwen-image: at most {MAX_REF_IMAGES} reference images"
             try:
                 payload = _payload(prompt, negative_prompt, width, height, steps, seed, transparent)
-                payload["images"] = [read_input_image(p) for p in images]
+                payload["images"] = [read_input_image(p, cfg.out_path) for p in images]
             except (ValueError, OSError) as exc:
                 return f"qwen-image: {exc}"
             return await _render("/edit", payload, out)
@@ -677,7 +700,10 @@ def register(
             + f"). Images are written to {cfg.out_path}. Rendering takes tens of seconds to "
             "minutes, so make one image at a time and reuse its seed when iterating. The "
             "tool result is a file path, not the picture — say where you saved it, and ask "
-            "the user to attach it with @<path> if you need to look at it yourself."
+            "the user to attach it with @<path> if you need to look at it yourself. "
+            "When the user asks you to change, restyle or fix an existing picture, call "
+            "image_edit with that file's path in 'images' — do not call image_generate, "
+            "which ignores the original and starts from scratch."
         )
 
     # -- lifecycle ------------------------------------------------------------
