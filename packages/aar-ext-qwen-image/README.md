@@ -19,7 +19,7 @@ aar ──(chat + tools)──► Ollama / any provider
 | Tool | Input | Output |
 |---|---|---|
 | `image_generate` | `prompt`, optional `negative_prompt`, `width`, `height`, `steps`, `seed`, `transparent`, `out` | path of the saved PNG + size, seed, steps, duration |
-| `image_edit` | `prompt`, `images[]` (up to 10 paths), same options | path of a **new** PNG — originals are never modified |
+| `image_edit` | `prompt`, `images[]` (up to 10 references), same options | path of a **new** PNG — originals are never modified |
 
 Both tools return a **file path**, because aar tool results are plain strings — the
 model never sees the pixels. To let it look at its own output, attach the file back
@@ -28,6 +28,20 @@ with `@~/.aar/qwen-image/out/foo.png` on a vision-capable provider.
 Output names are constrained: `out` must be a bare file name, it always lands inside
 the configured `out_dir`, the suffix is forced to `.png`, and an existing file is
 never overwritten (`sunset.png` → `sunset-1.png`).
+
+Reference images for `image_edit` are accepted in the three forms a model actually
+produces:
+
+| form | example |
+|---|---|
+| full or `~` path | `~/.aar/qwen-image/out/neon.png` |
+| aar's attachment syntax | `@~/.aar/qwen-image/out/neon.png` — the leading `@` is stripped |
+| bare file name | `neon.png` — resolved against `out_dir`, where `image_generate` writes |
+
+The second matters because when a user writes `@some/pic.png` the model passes that
+string straight through; the third because the model refers back to its own output by
+the name it just saved. A file that genuinely does not exist is still reported as
+`reference image not found`.
 
 > **`transparent: true` produces a real RGBA cutout.** Qwen-Image-2.1 generates
 > transparency natively, but it is requested in the *prompt text* — there is no
@@ -91,9 +105,17 @@ Measured on a 63.7 GB RAM / RX 7900 XTX box, `offload: "model"`, Qwen-Image-2.1:
 | peak during `image_edit` 1024px (1 reference) | **~102 GB** |
 
 The floor climbs over the first few renders and then plateaus; the *peak* is what kills
-you, and editing costs far more transient memory than generating. Budget a commit limit
-of **at least 112 GB** (RAM + page file) for comfortable `image_edit` use, or ~96 GB if
-you only ever call `image_generate`.
+you, and editing costs far more transient memory than generating. On the test machine:
+
+| commit limit | result |
+|---|---|
+| 83 GB (64 GB RAM + 20 GB page file) | crashed on the **second** render |
+| 104 GB (+ 40 GB page file) | five renders, then an `image_edit` crashed at 102.2 GB |
+| 110 GB (+ 46 GB page file) | stable, including `image_edit` |
+
+So budget **~110 GB** (RAM + page file) if you use `image_edit`, or ~96 GB if you only
+ever call `image_generate`. Raising the page file does not eliminate the ceiling — it
+moves it, and editing sits close enough to the line that a few GB matter.
 
 Check what you have:
 
@@ -104,12 +126,15 @@ Get-CimInstance Win32_PageFileSetting | Select-Object Name, InitialSize, Maximum
 ```
 
 To raise it, set an explicit page file size (elevated, then **reboot** — the file does
-not grow until restart). 40 GB on top of 64 GB of RAM gives a ~104 GB limit:
+not grow until restart). 46 GB on top of 64 GB of RAM gives a ~110 GB limit:
 
 ```powershell
 $pf = Get-CimInstance Win32_PageFileSetting -Filter "Name='c:\pagefile.sys'"
-Set-CimInstance -InputObject $pf -Property @{InitialSize = 40960; MaximumSize = 40960}
+Set-CimInstance -InputObject $pf -Property @{InitialSize = 46960; MaximumSize = 46960}
 ```
+
+The page file needs that much free disk. If the system drive is tight, put the extra
+page file on another volume rather than shrinking headroom on `C:`.
 
 Letting Windows manage the page file automatically is *not* reliable here: on the test
 machine it produced a fixed 20 GB file, which was not enough.
@@ -125,7 +150,7 @@ for 768px on an RX 7900 XTX, about 24 minutes for a 20-step image.
 | model load (weights cached on disk) | 23-39 s |
 | 512px, 8 steps | ~170 s |
 | 1024px, 30 steps | ~214 s |
-| 1024px, 30 steps, `image_edit` with 1 reference | ~385 s |
+| 1024px, 30 steps, `image_edit` with 1 reference | 228-385 s |
 
 Two things dominate and are easy to misread:
 
@@ -275,9 +300,26 @@ aar chat
 > /qwenimage generate a vintage travel poster for Reykjavik, bold lettering
 ```
 
-Then ask the agent things like *"Generate a 768x768 logo for this project and save it
-as logo.png"*, or *"Take `@shot.png` and use image_edit to replace the background with
-a plain white studio backdrop."*
+Then ask the agent in plain language. Three prompts that exercise the whole surface:
+
+```
+# legible in-image text — the model's headline strength
+> Use image_generate to make a 1024x1024 neon shop sign that reads "QWEN IMAGE 2.1",
+  rainy night, reflections on wet pavement. 30 steps, seed 42, save as neon.png
+
+# native RGBA, no keying step
+> Use image_generate with transparent=true to make a 768x768 cute cartoon dragon
+  sticker with bold outlines. 25 steps, seed 99, save as dragon.png
+
+# editing an existing picture — @path, a plain path or the bare name all work
+> Take @~/.aar/qwen-image/out/neon.png and use image_edit to change it to a bright
+  snowy morning with the sign switched off. 30 steps, save as neon-winter.png
+```
+
+The edit keeps the original's composition — same sign, same camera — and changes only
+what you asked for. If you instead get an unrelated fresh image, the model called
+`image_generate`; `~/.aar/qwen-image/server.log` shows `0 refs` on that render
+rather than `1 refs`.
 
 ## Supported sizes
 
