@@ -1,0 +1,623 @@
+"""Qwen-Image-2.1 render server — runs the model in its own Python environment.
+
+This file is deliberately standalone (no package-relative imports): the aar
+extension launches it by *file path* with the interpreter of a dedicated venv
+that has ``torch`` + ``diffusers`` + ``pillow``, so aar itself never needs the
+heavy ML stack.
+
+    python server.py --port 8770 --device auto --offload model
+    python server.py --list-devices          # what torch sees, then exit
+
+``--device auto`` picks the accelerator with the most memory.  ROCm builds of
+torch address AMD cards as ``cuda:N`` too — including AMD's native Windows
+wheels — so a Radeon card is selected exactly like an NVIDIA one; ``xpu``,
+``mps``, DirectML (``dml:N``) and ``cpu`` are also accepted.
+
+Endpoints (JSON):
+
+    GET  /health    {"status": "loading" | "ready" | "error", ...}
+    POST /generate  {"prompt": ..., "width": ..., "height": ..., "steps": ...,
+                     "seed": ..., "options": {...}}
+                    -> {"images": ["<base64 png>"], "seed": ..., "size": [w, h],
+                        "mode": "RGB", "steps": ..., "seconds": ..., "ignored": [...]}
+    POST /edit      same, plus {"images": ["<base64 png>", ...]} reference images
+    POST /shutdown  stop the server (frees VRAM)
+
+The socket is bound *before* the model loads, so a second instance on the same
+port fails immediately instead of downloading 20 GB of weights first.  The
+server exits on its own after ``--idle-timeout`` seconds without a request.
+
+Renders are serialised behind one lock: a single diffusion pipeline cannot run
+two prompts at once, and on an offloaded GPU a second one would thrash.
+
+Unknown pipeline options (``true_cfg_scale``, ``output_resolution``, …) are filtered
+against the installed pipeline's real signature and reported back in
+``ignored`` rather than raising — diffusers' Qwen-Image support moves quickly,
+and a missing keyword should degrade to a plain render, not an error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import inspect
+import io
+import logging
+import os
+import random
+import socket
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("qwen_image.server")
+
+# "auto" lets ``DiffusionPipeline`` read the checkpoint's model_index.json and pick
+# the class the weights were published with — more durable than naming one here,
+# since Qwen-Image-2.1 landed on diffusers main before any tagged release had it.
+DEFAULT_PIPELINE = "auto"
+# Qwen-Image-2.1 is a unified generate+edit model, but diffusers has shipped the
+# editing half under several names.  Tried in order, first hit wins.
+EDIT_PIPELINE_CANDIDATES = (
+    "QwenImage21EditPipeline",
+    "QwenImage21EditPlusPipeline",
+    "QwenImageEditPlusPipeline",
+    "QwenImageEditPipeline",
+    "QwenImageImg2ImgPipeline",
+)
+DTYPES = ("bfloat16", "float16", "float32")
+MAX_SEED = 2**31 - 1
+
+
+# ---------------------------------------------------------------------------
+# Backend
+# ---------------------------------------------------------------------------
+
+
+class Backend(Protocol):
+    """What the HTTP layer needs from a model backend (a fake one in tests)."""
+
+    def health(self) -> dict[str, Any]: ...
+
+    def render(self, req: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@dataclass
+class ModelSettings:
+    model: str = "Qwen/Qwen-Image-2.1"
+    pipeline: str = DEFAULT_PIPELINE
+    device: str = "auto"
+    dtype: str = "bfloat16"
+    offload: str = "model"  # "none" | "model" | "sequential"
+
+
+# ---------------------------------------------------------------------------
+# Device discovery
+#
+# torch names devices by *backend*, not by vendor: a ROCm build reports an AMD
+# card as ``cuda:0`` and ``torch.version.hip`` is set.  So the selection logic
+# below is vendor-agnostic, and only the reported ``backend`` differs.
+# ---------------------------------------------------------------------------
+
+
+def available_devices() -> list[dict[str, Any]]:
+    """List the accelerators visible to torch, largest memory first, then cpu."""
+    import torch
+
+    found: list[dict[str, Any]] = []
+    if torch.cuda.is_available():
+        backend = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            found.append(
+                {
+                    "device": f"cuda:{i}",
+                    "name": props.name,
+                    "total_gb": round(props.total_memory / 2**30, 1),
+                    "backend": backend,
+                }
+            )
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        for i in range(xpu.device_count()):
+            props = xpu.get_device_properties(i)
+            found.append(
+                {
+                    "device": f"xpu:{i}",
+                    "name": getattr(props, "name", "Intel GPU"),
+                    "total_gb": round(getattr(props, "total_memory", 0) / 2**30, 1),
+                    "backend": "xpu",
+                }
+            )
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        found.append({"device": "mps", "name": "Apple GPU", "total_gb": 0.0, "backend": "mps"})
+    try:  # DirectML — the only way to reach an AMD/Intel GPU on native Windows
+        import torch_directml
+
+        for i in range(torch_directml.device_count()):
+            found.append(
+                {
+                    "device": f"dml:{i}",
+                    "name": torch_directml.device_name(i),
+                    "total_gb": 0.0,
+                    "backend": "directml",
+                }
+            )
+    except Exception:
+        pass
+    found.sort(key=lambda d: d["total_gb"], reverse=True)
+    found.append({"device": "cpu", "name": "CPU", "total_gb": 0.0, "backend": "cpu"})
+    return found
+
+
+def resolve_device(requested: str) -> str:
+    """Turn ``auto`` into a concrete device string and validate an explicit one."""
+    devices = available_devices()
+    if requested == "auto":
+        chosen = devices[0]["device"]
+        logger.info(
+            "device auto -> %s (%s); candidates: %s",
+            chosen,
+            devices[0]["name"],
+            ", ".join(f"{d['device']}={d['name']}" for d in devices),
+        )
+        return chosen
+    known = {d["device"] for d in devices}
+    if requested not in known and requested.split(":")[0] not in {"cuda", "xpu", "mps", "cpu"}:
+        raise RuntimeError(
+            f"unknown device {requested!r}; torch sees: "
+            + ", ".join(f"{d['device']} ({d['name']})" for d in devices)
+        )
+    if requested.startswith("cuda") and not any(d["device"].startswith("cuda") for d in devices):
+        raise RuntimeError(
+            "no CUDA/ROCm device is visible to torch in this environment — "
+            "run --list-devices to see what is. An AMD GPU needs a ROCm build of "
+            "torch (AMD ships native Windows wheels on repo.radeon.com), not a "
+            "stock CUDA build."
+        )
+    return requested
+
+
+def torch_device(device: str) -> Any:
+    """Map a device string onto something torch accepts (DirectML needs a lookup)."""
+    if device.startswith("dml"):
+        import torch_directml
+
+        _, _, index = device.partition(":")
+        return torch_directml.device(int(index or 0))
+    return device
+
+
+def split_kwargs(fn: Any, kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Split *kwargs* into those *fn* accepts and the names it does not.
+
+    A ``**kwargs`` parameter means everything is accepted.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # C callable / no introspectable signature
+        return dict(kwargs), []
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs), []
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    return accepted, sorted(set(kwargs) - set(accepted))
+
+
+def decode_image(data: str) -> Any:
+    """Decode a base64 image into a PIL image."""
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"malformed base64 image: {exc}") from exc
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except UnidentifiedImageError as exc:
+        raise ValueError(f"unreadable image: {exc}") from exc
+
+
+def encode_image(image: Any) -> str:
+    """Encode a PIL image as a base64 PNG (keeping an alpha channel if present)."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@dataclass
+class QwenImageBackend:
+    """Loads Qwen-Image-2.1 and renders one request at a time."""
+
+    settings: ModelSettings
+    status: str = "loading"
+    error: str | None = None
+    load_seconds: float | None = None
+    pipeline_name: str | None = None  # the class actually instantiated
+    edit_pipeline_name: str | None = None
+    device: str = ""  # resolved from settings.device at load time
+    devices: list[dict[str, Any]] = field(default_factory=list)
+    _pipe: Any = None
+    _edit_pipe: Any = None
+    _placed: Any = None  # pipeline the offload hooks are currently installed on
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def load(self) -> None:
+        t0 = time.monotonic()
+        try:
+            self._load()
+        except Exception as exc:  # reported via /health, the process stays up
+            logger.exception("model load failed")
+            self.status, self.error = "error", f"{type(exc).__name__}: {exc}"
+            return
+        self.load_seconds = round(time.monotonic() - t0, 1)
+        self.status = "ready"
+        logger.info("model ready in %.1fs (%s)", self.load_seconds, self._vram())
+
+    def _load(self) -> None:
+        import diffusers
+        import torch
+
+        s = self.settings
+        if s.dtype not in DTYPES:
+            raise ValueError(f"dtype must be one of {', '.join(DTYPES)}, got {s.dtype!r}")
+        self.devices = available_devices()
+        self.device = resolve_device(s.device)
+
+        if s.pipeline == "auto":
+            pipe_cls = diffusers.DiffusionPipeline
+        else:
+            pipe_cls = getattr(diffusers, s.pipeline, None)
+            if pipe_cls is None:
+                raise RuntimeError(
+                    f"diffusers {diffusers.__version__} has no {s.pipeline}; it exposes "
+                    + ", ".join(n for n in dir(diffusers) if n.endswith("Pipeline"))[:400]
+                )
+
+        logger.info("loading %s via %s (%s) on %s", s.model, s.pipeline, s.dtype, self.device)
+        try:
+            pipe = pipe_cls.from_pretrained(s.model, torch_dtype=getattr(torch, s.dtype))
+        except ValueError as exc:
+            # from_pretrained raises ValueError for many reasons; only an unknown class
+            # name means "your diffusers is too old". Attaching that hint to every
+            # ValueError sends people chasing the wrong fix — a missing
+            # processor/chat_template.jinja surfaces here too, for instance.
+            if "cannot be loaded" in str(exc) or "has no attribute" in str(exc):
+                raise RuntimeError(
+                    f"{exc}\n\ndiffusers {diffusers.__version__} does not know this "
+                    "pipeline class. Qwen-Image-2.1 support may only exist on main: "
+                    "pip install -U git+https://github.com/huggingface/diffusers"
+                ) from exc
+            raise
+        self.pipeline_name = type(pipe).__name__
+        self._pipe = pipe
+
+        # Qwen-Image-2.1 is a *unified* model: its pipeline takes `image=` for editing,
+        # so prefer it over any separate Edit class — those expect the older
+        # Qwen-Image components and would be handed mismatched weights.
+        _, missing = split_kwargs(type(pipe).__call__, {"image": None})
+        if not missing:
+            self._edit_pipe = pipe
+            self.edit_pipeline_name = self.pipeline_name
+        else:
+            # Older checkpoints split the two. Reuse the loaded weights rather than
+            # a second copy, and build *before* offload hooks are installed, because
+            # those hooks are per-pipeline bookkeeping over shared modules.
+            for name in EDIT_PIPELINE_CANDIDATES:
+                edit_cls = getattr(diffusers, name, None)
+                if edit_cls is None:
+                    continue
+                try:
+                    self._edit_pipe = edit_cls(**pipe.components)
+                except (TypeError, ValueError) as exc:
+                    logger.warning("cannot build %s from loaded components: %s", name, exc)
+                    continue
+                self.edit_pipeline_name = name
+                break
+            else:
+                self._edit_pipe = pipe  # no candidate: /edit will report the problem
+                self.edit_pipeline_name = self.pipeline_name
+        logger.info("edit pipeline: %s", self.edit_pipeline_name)
+        self._place(pipe)
+        self._placed = pipe
+
+    def _place(self, pipe: Any) -> None:
+        """Apply the configured offload strategy, or move the pipeline to the GPU."""
+        offload = self.settings.offload
+        device = torch_device(self.device)
+        if offload == "sequential":
+            pipe.enable_sequential_cpu_offload(device=device)
+        elif offload == "model":
+            pipe.enable_model_cpu_offload(device=device)
+        elif offload == "none":
+            pipe.to(device)
+        else:
+            raise ValueError(f"offload must be none, model or sequential, got {offload!r}")
+
+    def _vram(self) -> str:
+        if self.device.startswith("cuda"):
+            try:
+                import torch
+
+                used = torch.cuda.memory_allocated(torch.device(self.device)) / 2**30
+                name = torch.cuda.get_device_name(torch.device(self.device))
+                return f"{self.device} ({name}), {used:.2f} GB allocated"
+            except Exception:
+                pass
+        for entry in self.devices:
+            if entry["device"] == self.device:
+                return f"{self.device} ({entry['name']})"
+        return self.device
+
+    def health(self) -> dict[str, Any]:
+        s = self.settings
+        return {
+            "status": self.status,
+            "error": self.error,
+            "model": s.model,
+            "pipeline": self.pipeline_name or s.pipeline,
+            "edit_pipeline": self.edit_pipeline_name,
+            "dtype": s.dtype,
+            "offload": s.offload,
+            "requested_device": s.device,
+            "device": self._vram() if self.status == "ready" else s.device,
+            "devices": self.devices,
+            "load_seconds": self.load_seconds,
+            "pid": os.getpid(),
+        }
+
+    def _generator(self, seed: int) -> Any:
+        import torch
+
+        # With offloading the modules move between CPU and GPU, and DirectML has
+        # no generator of its own, so a CPU generator is the portable choice.
+        on_device = self.settings.offload == "none" and self.device.startswith("cuda")
+        return torch.Generator(device=self.device if on_device else "cpu").manual_seed(seed)
+
+    def render(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Run one generate (no ``images``) or edit (with ``images``) request."""
+        if self.status != "ready":
+            raise RuntimeError(f"model not ready (status={self.status})")
+
+        refs = [decode_image(b) for b in req.get("images") or []]
+        pipe = self._edit_pipe if refs else self._pipe
+        if pipe is not self._placed:
+            # Offload hooks belong to one pipeline at a time even when the two share
+            # modules, so hand them over before running the other one.
+            self._place(pipe)
+            self._placed = pipe
+        seed = req.get("seed")
+        seed = random.randint(0, MAX_SEED) if seed is None else int(seed) % (MAX_SEED + 1)
+
+        kwargs: dict[str, Any] = {
+            "prompt": req["prompt"],
+            "width": req["width"],
+            "height": req["height"],
+            "num_inference_steps": req["steps"],
+            "generator": self._generator(seed),
+        }
+        if req.get("negative_prompt"):
+            kwargs["negative_prompt"] = req["negative_prompt"]
+        if refs:
+            kwargs["image"] = refs if len(refs) > 1 else refs[0]
+
+        options = {k: v for k, v in (req.get("options") or {}).items() if v not in (None, False)}
+        accepted, ignored = split_kwargs(type(pipe).__call__, {**kwargs, **options})
+        if "image" in ignored:
+            raise RuntimeError(
+                f"{self.edit_pipeline_name} does not accept reference images; "
+                "upgrade diffusers or set 'tools' to ['image_generate'] in the config"
+            )
+
+        t0 = time.monotonic()
+        with self._lock:
+            image = pipe(**accepted).images[0]
+        seconds = round(time.monotonic() - t0, 1)
+        logger.info(
+            "rendered %dx%d in %.1fs (%d refs, seed %d)",
+            image.width, image.height, seconds, len(refs), seed,
+        )  # fmt: skip
+        return {
+            "images": [encode_image(image)],
+            "seed": seed,
+            "size": [image.width, image.height],
+            "mode": image.mode,
+            "steps": req["steps"],
+            "seconds": seconds,
+            "ignored": ignored,
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTTP app
+# ---------------------------------------------------------------------------
+
+
+class RenderRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    negative_prompt: str = ""
+    width: int = Field(default=1024, ge=64, le=4096)
+    height: int = Field(default=1024, ge=64, le=4096)
+    steps: int = Field(default=30, ge=1, le=200)
+    seed: int | None = None
+    images: list[str] = Field(default_factory=list)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class Activity:
+    """Tracks the time of the last request for the idle watchdog."""
+
+    def __init__(self) -> None:
+        self.last = time.monotonic()
+
+    def touch(self) -> None:
+        self.last = time.monotonic()
+
+    def idle_for(self) -> float:
+        return time.monotonic() - self.last
+
+
+def create_app(
+    backend: Backend,
+    activity: Activity | None = None,
+    on_shutdown: Any = None,
+    max_images: int = 10,
+    max_pixels: int = 2048 * 2048,
+) -> Any:
+    """Build the FastAPI app around *backend* (kept separate for testing)."""
+    from fastapi import FastAPI, HTTPException
+
+    activity = activity or Activity()
+    app = FastAPI(title="qwen-image", docs_url=None, redoc_url=None)
+
+    def _render(req: RenderRequest, editing: bool) -> dict[str, Any]:
+        if editing and not req.images:
+            raise HTTPException(422, detail="/edit needs at least one reference image")
+        if len(req.images) > max_images:
+            raise HTTPException(422, detail=f"at most {max_images} reference images")
+        if req.width * req.height > max_pixels:
+            raise HTTPException(
+                422, detail=f"{req.width}x{req.height} exceeds max_pixels ({max_pixels})"
+            )
+        activity.touch()
+        state = backend.health()
+        if state["status"] != "ready":
+            raise HTTPException(503, detail=state.get("error") or state["status"])
+        try:
+            return backend.render(req.model_dump())
+        except ValueError as exc:  # unreadable reference image
+            raise HTTPException(422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(500, detail=str(exc)) from exc
+        finally:
+            activity.touch()
+
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return backend.health()
+
+    @app.post("/generate")
+    def generate(req: RenderRequest) -> dict[str, Any]:
+        return _render(req.model_copy(update={"images": []}), editing=False)
+
+    @app.post("/edit")
+    def edit(req: RenderRequest) -> dict[str, Any]:
+        return _render(req, editing=True)
+
+    @app.post("/shutdown")
+    def shutdown() -> dict[str, str]:
+        logger.info("shutdown requested via /shutdown")
+        if on_shutdown is not None:
+            on_shutdown()
+        return {"status": "stopping"}
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    d = ModelSettings()
+    ap = argparse.ArgumentParser(description="Qwen-Image-2.1 render server")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8770)
+    ap.add_argument("--model", default=d.model)
+    ap.add_argument("--pipeline", default=d.pipeline, help="diffusers text-to-image pipeline class")
+    ap.add_argument(
+        "--device",
+        default=d.device,
+        help="auto (most memory), cuda:N (NVIDIA, or AMD on a ROCm build), xpu, mps, dml:N, cpu",
+    )
+    ap.add_argument(
+        "--list-devices", action="store_true", help="print the devices torch sees and exit"
+    )
+    ap.add_argument("--dtype", choices=DTYPES, default=d.dtype)
+    ap.add_argument(
+        "--offload",
+        choices=["none", "model", "sequential"],
+        default=d.offload,
+        help="CPU offload strategy: none needs ~20 GB VRAM, sequential the least (and is slowest)",
+    )
+    ap.add_argument("--max-images", type=int, default=10)
+    ap.add_argument("--max-pixels", type=int, default=2048 * 2048)
+    ap.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=900.0,
+        help="exit after this many seconds without a request (0 = never)",
+    )
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+    if args.list_devices:
+        for d in available_devices():
+            size = f"{d['total_gb']:.1f} GB" if d["total_gb"] else "unknown size"
+            print(f"{d['device']:<12} {d['backend']:<9} {size:<12} {d['name']}")
+        return 0
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((args.host, args.port))
+    except OSError as exc:
+        logger.error(
+            "cannot bind %s:%d (%s) — is another server running?", args.host, args.port, exc
+        )
+        return 2
+
+    import uvicorn
+
+    backend = QwenImageBackend(
+        ModelSettings(
+            model=args.model,
+            pipeline=args.pipeline,
+            device=args.device,
+            dtype=args.dtype,
+            offload=args.offload,
+        )
+    )
+    activity = Activity()
+    server: uvicorn.Server | None = None
+
+    def stop() -> None:
+        if server is not None:
+            server.should_exit = True
+
+    app = create_app(
+        backend,
+        activity,
+        on_shutdown=stop,
+        max_images=args.max_images,
+        max_pixels=args.max_pixels,
+    )
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+
+    def watchdog() -> None:
+        while not server.should_exit:
+            time.sleep(10)
+            if args.idle_timeout > 0 and activity.idle_for() > args.idle_timeout:
+                logger.info("idle for %.0fs — shutting down", activity.idle_for())
+                stop()
+
+    threading.Thread(target=backend.load, name="qwen-image-load", daemon=True).start()
+    threading.Thread(target=watchdog, name="qwen-image-idle", daemon=True).start()
+    logger.info("listening on http://%s:%d (pid %d)", args.host, args.port, os.getpid())
+    server.run(sockets=[sock])
+    logger.info("server stopped (pid %d)", os.getpid())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

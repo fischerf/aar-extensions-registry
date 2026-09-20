@@ -17,6 +17,7 @@ Curated registry and first-party extension packages for the [Aar](https://github
       aar-ext-mcp-tools/         - MCP server tool discovery via extension API
       aar-ext-observability/     - structured metrics per turn
       aar-ext-openjev/           - local NLI verification tools (openjev cross-encoder)
+      aar-ext-qwen-image/        - local image generation and editing (Qwen-Image-2.1)
 
 ## First-Party Extensions
 
@@ -28,6 +29,7 @@ Curated registry and first-party extension packages for the [Aar](https://github
 | [aar-ext-mcp-tools](packages/aar-ext-mcp-tools/) | MCP server tool discovery via extension API | Reference |
 | [aar-ext-observability](packages/aar-ext-observability/) | Structured metrics/logging per turn | Ready |
 | [aar-ext-openjev](packages/aar-ext-openjev/) | Local NLI tools: verify claims, rerank and grade answers (openjev, 4-bit on a spare GPU) | Ready |
+| [aar-ext-qwen-image](packages/aar-ext-qwen-image/) | Local text-to-image and image editing (Qwen-Image-2.1 on a diffusers sidecar, NVIDIA or AMD/ROCm) | Ready |
 
 Each package has its own pyproject.toml, source, README, and tests.
 

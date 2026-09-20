@@ -1,7 +1,7 @@
 {
   "": "./schema/extensions.schema.json",
   "version": "1.0.0",
-  "updated": "2026-09-18",
+  "updated": "2026-09-20",
   "extensions": [
     {
       "name": "permission-gate",
@@ -93,6 +93,16 @@
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar-extensions-registry",
       "homepage": "https://huggingface.co/convaiinnovations/laya",
+      "status": "planned"
+    },
+    {
+      "name": "qwen-image",
+      "pypi": "aar-ext-qwen-image",
+      "description": "Local text-to-image and image editing tools backed by Qwen-Image-2.1 (diffusers sidecar server, NVIDIA or AMD/ROCm)",
+      "tags": ["tool"],
+      "author": "Aar Team",
+      "repository": "https://github.com/fischerf/aar-extensions-registry",
+      "homepage": "https://huggingface.co/Qwen/Qwen-Image-2.1",
       "status": "planned"
     },
     {

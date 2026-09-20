@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aar-ext-qwen-image"
+version = "0.1.0"
+description = "Local text-to-image and image editing tools backed by Qwen-Image-2.1"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aar-agent", "httpx>=0.28"]
+keywords = ["aar-extension", "image-generation", "diffusion", "qwen", "tool"]
+license = { text = "Apache-2.0" }
+
+[project.optional-dependencies]
+# Installed into the *server* venv, not into aar's environment.
+# Install torch from the CUDA index first, e.g. --index-url https://download.pytorch.org/whl/cu128
+server = [
+  "torch>=2.6",
+  # Qwen-Image-2.1 support may still be main-only — see the README:
+  #   pip install -U git+https://github.com/huggingface/diffusers
+  "diffusers>=0.36",
+  "transformers>=4.56",
+  "accelerate",
+  "safetensors",
+  "pillow",
+  "pydantic>=2",
+  "fastapi",
+  "uvicorn",
+]
+test = ["pytest", "pytest-asyncio", "fastapi"]
+
+[project.urls]
+"Home" = "https://github.com/fischerf/aar"
+"Repository" = "https://github.com/fischerf/aar-extensions-registry"
+"Model" = "https://huggingface.co/Qwen/Qwen-Image-2.1"
+
+[project.entry-points."aar_extensions"]
+qwen_image = "aar_ext_qwen_image:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aar_ext_qwen_image"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
