@@ -11,8 +11,13 @@ ideally on the GPU with the most VRAM. aar never imports torch or diffusers.
 
 ```
 aar ──(chat + tools)──► Ollama / any provider
- └──(image_generate …)─► qwen-image server (venv, torch + diffusers, ~31 GB of weights)
+ └──(image_generate …)─► qwen-image server (venv, torch + diffusers, ~31 GiB of weights)
 ```
+
+The transformer can be swapped for a [GGUF quantization](#quantized-transformer-gguf)
+of the same weights (`quant` / `/qwenimage quant`), which drops the pipeline from
+~31 GiB to ~22 GiB and is the difference between a comfortable and a strained 24 GB
+card.
 
 ## Tools
 
@@ -55,6 +60,8 @@ the name it just saved. A file that genuinely does not exist is still reported a
 ```
 /qwenimage                      status (model, device, VRAM, pid)
 /qwenimage devices              every GPU torch can see, and which one is in use
+/qwenimage quant                list the quantizations, marking the active one
+/qwenimage quant Q4_K_M         switch weights (applies on the next server start)
 /qwenimage start                launch the server in the background
 /qwenimage stop                 stop it and free VRAM
 /qwenimage generate <prompt>    quick manual test
@@ -80,17 +87,22 @@ directly:
 python path/to/aar_ext_qwen_image/server.py --list-devices
 ```
 
-**VRAM.** The bf16 weights are ~31 GB on disk — transformer 13.3 GB, text encoder
-16.3 GB, VAE 1.3 GB — so the whole pipeline does *not* fit in 24 GB at once. With
+**VRAM.** The bf16 weights are ~31 GiB on disk — transformer 13.3 GiB, text encoder
+16.3 GiB, VAE 1.3 GiB — so the whole pipeline does *not* fit in 24 GB at once. With
 `offload: "model"` each component is staged onto the GPU as it is needed, which is the
 fast path on a 24 GB card; `offload: "sequential"` streams individual layers and fits
 on ~8 GB, at a large speed cost. On a 6 GB card, prefer 512–768px with 20–25 steps.
 
+Every figure below is for the unquantized transformer. Setting
+[`quant`](#quantized-transformer-gguf) takes 6–9 GiB off all of them.
+
 ### Windows: size your page file before using `model` offload
 
-`offload: "model"` keeps all ~31 GB of bf16 weights in CPU RAM and stages one whole
+`offload: "model"` keeps all ~31 GiB of bf16 weights in CPU RAM and stages one whole
 component onto the GPU at a time, so a render's real cost is **committed host memory**,
-not just VRAM. Windows' commit limit is RAM **plus the page file**, and when a render
+not just VRAM. (A [GGUF transformer](#quantized-transformer-gguf) shrinks the resident
+set by 6–9 GiB, which moves every number in this section down — but does not change the
+shape of the problem, so size the page file anyway.) Windows' commit limit is RAM **plus the page file**, and when a render
 asks for more than is left, the allocation fails inside `c10::alloc_cpu` and the process
 dies with exception `0xC0000005` and **no Python traceback** — the client just sees the
 connection close mid-render.
@@ -196,7 +208,7 @@ $py = "$HOME\.aar\qwen-image\.venv\Scripts\python.exe"
     https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl `
     https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
 & $py -m pip install git+https://github.com/huggingface/diffusers `
-    transformers accelerate safetensors pillow fastapi uvicorn
+    transformers accelerate safetensors pillow fastapi uvicorn "gguf>=0.10"
 ```
 
 Version numbers move — take the current ones from
@@ -216,7 +228,7 @@ Python 3.14 has no torch wheels either.
    `amdgpu-install --usecase=wsl,rocm --no-dkms`).
 2. Build the venv with `python3.12` and install the Linux ROCm torch wheels plus
    `diffusers` (from git, see below), `transformers`, `accelerate`, `safetensors`,
-   `pillow`, `fastapi`, `uvicorn`.
+   `pillow`, `fastapi`, `uvicorn` and — for `quant` — `gguf>=0.10`.
 3. Point the extension at it from Windows (`~/.aar/qwen-image.json`):
 
    ```json
@@ -233,6 +245,101 @@ Python 3.14 has no torch wheels either.
    works, nothing needs copying. WSL2's localhost forwarding makes the server
    reachable at `127.0.0.1:8770` from Windows. If that proves flaky, run the server
    with `--host 0.0.0.0` and set `url` to the distro's IP.
+
+## Quantized transformer (GGUF)
+
+`quant` loads the transformer from a GGUF quantization of the *same* Qwen-Image-2.1
+weights instead of the published bf16 tensors. Only the transformer is quantized —
+the text encoder and VAE are unchanged, and still come from `Qwen/Qwen-Image-2.1`.
+
+| `quant` | file | size | note |
+|---|---|---|---|
+| `none` (default) | base checkpoint | 13.3 GiB | published bf16 weights |
+| `Q8_0` | `qwen-image-2.1-Q8_0.gguf` | 7.1 GiB | closest to bf16 |
+| `Q6_K` | `qwen-image-2.1-Q6_K.gguf` | 5.5 GiB | |
+| `Q5_K_M` | `qwen-image-2.1-Q5_K_M.gguf` | 4.9 GiB | |
+| `Q4_K_M` | `qwen-image-2.1-Q4_K_M.gguf` | 4.3 GiB | **recommended** |
+| `Q4_0` | `qwen-image-2.1-Q4_0.gguf` | 3.8 GiB | smallest |
+
+Sizes are GiB, to match how VRAM is counted everywhere else here;
+[the model card](https://huggingface.co/abenzerps/Qwen-Image-2.1-GGUF) lists the same
+files in decimal GB, so its numbers run ~7% higher.
+
+```
+/qwenimage quant                 # what is available, and what is active
+/qwenimage quant Q4_K_M          # write it to ~/.aar/qwen-image.json
+/qwenimage stop                  # then restart to load it
+```
+
+The switch is persisted to the config file; a server that is already running keeps
+the weights it started with, so `/qwenimage status` reports the *server's* quant, not
+the config's, while one is loaded.
+
+Equivalent config, if you prefer to edit the file:
+
+```json
+{ "quant": "Q4_K_M" }
+```
+
+The file is fetched into the normal Hugging Face cache on first load. To use a
+quantization you built yourself, point `quant_file` at it (an existing path wins over
+any download); a bare file name is looked up in `quant_repo` instead.
+
+### Why it helps on a 24 GB card
+
+Weights only have to *be* in VRAM — getting them there is the expensive part. On an
+RX 7900 XTX the card itself does ~770 GB/s, but host↔device transfer runs at about
+2.5 GB/s:
+
+```
+Vector Addition: 772.88 GB/s          float16  : 102.03 TFLOPS
+Memory Copy:     710.93 GB/s          bfloat16 :  97.78 TFLOPS
+CPU -> GPU:      2.56 GB/s
+GPU -> CPU:      2.80 GB/s
+```
+
+`offload: "model"` stages one whole component onto the GPU at a time, so every render
+pays that 2.5 GB/s for the transformer. At bf16 that is 13.3 GiB ≈ **5.6 s** of pure
+copying per render; at `Q4_K_M` it is 4.3 GiB ≈ **1.8 s**. The same 9 GiB comes off the
+committed host memory the page-file section below is about.
+
+With a quantized transformer the whole pipeline is ~22 GiB instead of ~31 GiB, which
+puts `offload: "none"` within reach on a 24 GB card — everything stays resident and
+renders stop paying for staging at all. It is tight (the bf16 text encoder alone is
+16.3 GiB), so treat it as worth trying rather than a safe default: if it OOMs, go back
+to `offload: "model"`, which is still meaningfully faster and lighter than it was with
+bf16 weights.
+
+`dtype` stays `bfloat16` — it is the compute dtype the dequantized blocks are
+promoted to. The benchmark above shows fp16 marginally ahead of bf16 on this card
+(102 vs 98 TFLOPS), but the margin is well inside noise for a render dominated by
+attention and VAE decode, and bf16's exponent range is what the model was trained in.
+
+### Requirements
+
+The `gguf` package must be in the *server* venv (it is in the `server` extra):
+
+```bash
+pip install "gguf>=0.10"
+```
+
+diffusers reads the file with its own `GGUFQuantizationConfig` — this is not
+ComfyUI-GGUF and needs no custom nodes. The server loads the transformer with
+`from_single_file`, then hands it to `from_pretrained`, which skips downloading the
+base transformer entirely.
+
+One wrinkle is handled for you. diffusers dispatches `from_single_file` through a
+table of known classes, and `QwenImage21Transformer2DModel` does not subclass the 1.0
+transformer, so the lookup misses it and loading would fail. The server registers the
+same identity entry the 1.0 class uses (`ensure_single_file_loadable`), which is exact
+rather than a guess: all 297 tensors in these files already carry diffusers' own
+parameter names — `transformer_blocks.N.attn.to_q.weight`, `modulation.1.weight`,
+`img_mlp.gate_layer.weight` — so nothing is converted. It becomes a no-op the day
+diffusers ships an entry of its own.
+
+The text encoder and VAE in that repo are ComfyUI-packaged single files and are *not*
+used; `transformers` wants the sharded `Qwen3VLForConditionalGeneration` layout from
+the base checkpoint, so the 16.3 GiB text encoder is still downloaded once.
 
 ## diffusers version
 
@@ -274,8 +381,12 @@ $py = "$HOME\.aar\qwen-image\.venv\Scripts\python.exe"
 & $py -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 & $py -m pip install git+https://github.com/huggingface/diffusers `
     transformers accelerate safetensors pillow fastapi uvicorn
-# optional: pre-download the weights (~31 GB) instead of waiting on the first render
+& $py -m pip install "gguf>=0.10"       # only needed for quant != "none"
+# optional: pre-download the weights (~31 GiB) instead of waiting on the first render
 & "$HOME\.aar\qwen-image\.venv\Scripts\hf.exe" download Qwen/Qwen-Image-2.1
+# with quant: the base transformer is never fetched, so pull the GGUF instead
+& "$HOME\.aar\qwen-image\.venv\Scripts\hf.exe" download `
+    abenzerps/Qwen-Image-2.1-GGUF qwen-image-2.1-Q4_K_M.gguf
 ```
 
 For AMD, use the ROCm wheels from *Choosing a GPU* above instead of the `cu128` index.
@@ -419,7 +530,10 @@ cp packages/aar-ext-qwen-image/qwen-image.example.json ~/.aar/qwen-image.json
 | `autostart` | `on_demand` | `on_demand`: first tool call starts the server; `session`: start when a session starts; `off`: only `/qwenimage start` |
 | `device` | `auto` | see *Choosing a GPU* |
 | `dtype` | `bfloat16` | `float16` for cards without bf16; `float32` doubles memory |
-| `offload` | `model` | `none` (needs ~31 GB VRAM), `model` (fast path on 24 GB), `sequential` (smallest, slowest) |
+| `offload` | `model` | `none` (needs ~31 GiB VRAM, or ~22 GiB with `quant`), `model` (fast path on 24 GB), `sequential` (smallest, slowest) |
+| `quant` | `none` | GGUF quantization of the transformer — see [Quantized transformer](#quantized-transformer-gguf) |
+| `quant_repo` | `abenzerps/Qwen-Image-2.1-GGUF` | where the `.gguf` files are fetched from |
+| `quant_file` | `null` | explicit `.gguf` path, or a file name inside `quant_repo`; overrides `quant` |
 | `launcher` | `[]` | argv prefix for the server, e.g. `["wsl.exe", "-d", "Ubuntu-24.04", "--"]` |
 | `server_script` | `null` | path to `server.py` as the launcher sees it |
 | `cuda_visible_devices` / `hip_visible_devices` | `null` | set to hide other cards from the server |
@@ -465,4 +579,6 @@ AAR_QWEN_IMAGE_LIVE=1 python -m pytest tests/ -v    # plus a live render against
 
 Apache License 2.0 — same as Aar. The Qwen-Image-2.1 weights are covered by the
 [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1), which is *not* a
-plain open-source licence — check it before any commercial use.
+plain open-source licence — check it before any commercial use. The GGUF files are a
+requantization of those same weights and carry the same licence; note also that,
+unlike the base checkpoint, that repo advertises itself as having no content filter.

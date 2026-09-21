@@ -6,7 +6,13 @@ that has ``torch`` + ``diffusers`` + ``pillow``, so aar itself never needs the
 heavy ML stack.
 
     python server.py --port 8770 --device auto --offload model
-    python server.py --list-devices          # what torch sees, then exit
+    python server.py --port 8770 --quant Q4_K_M       # GGUF transformer
+    python server.py --list-devices                   # what torch sees, then exit
+
+``--quant`` loads the transformer from a GGUF quantization instead of the base
+checkpoint's bf16 weights, keeping the text encoder and VAE unquantized.  The
+tensor names in those files are already the ones diffusers uses, so nothing is
+converted — see ``ensure_single_file_loadable``.
 
 ``--device auto`` picks the accelerator with the most memory.  ROCm builds of
 torch address AMD cards as ``cuda:N`` too — including AMD's native Windows
@@ -51,6 +57,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -73,6 +80,13 @@ EDIT_PIPELINE_CANDIDATES = (
 DTYPES = ("bfloat16", "float16", "float32")
 MAX_SEED = 2**31 - 1
 
+# Kept in step with GGUF_QUANTS in __init__.py by hand: this file is standalone
+# on purpose (it runs under a different interpreter) and cannot import from the
+# package.
+GGUF_QUANTS = ("Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0")
+GGUF_REPO = "abenzerps/Qwen-Image-2.1-GGUF"
+GGUF_FILE_TEMPLATE = "qwen-image-2.1-{quant}.gguf"
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -94,6 +108,9 @@ class ModelSettings:
     device: str = "auto"
     dtype: str = "bfloat16"
     offload: str = "model"  # "none" | "model" | "sequential"
+    quant: str = "none"  # "none" or one of GGUF_QUANTS
+    quant_repo: str = GGUF_REPO
+    quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +210,74 @@ def torch_device(device: str) -> Any:
     return device
 
 
+# ---------------------------------------------------------------------------
+# Quantized transformer (GGUF)
+#
+# Only the transformer is quantized.  The text encoder (Qwen3-VL-8B) and the VAE
+# still load from the base checkpoint, and diffusers skips downloading the base
+# transformer entirely once one is passed to ``from_pretrained``.
+# ---------------------------------------------------------------------------
+
+
+def gguf_filename(quant: str) -> str:
+    """Repo file name for a quantization label."""
+    if quant not in GGUF_QUANTS:
+        raise ValueError(f"quant must be none or one of {', '.join(GGUF_QUANTS)}, got {quant!r}")
+    return GGUF_FILE_TEMPLATE.format(quant=quant)
+
+
+def resolve_gguf_path(settings: ModelSettings) -> str:
+    """Local path of the GGUF transformer, fetching it into the HF cache if needed.
+
+    ``quant_file`` may be a path to a file already on disk — useful for a
+    quantization built locally — or a name to look up in ``quant_repo``.
+    """
+    explicit = settings.quant_file
+    if explicit:
+        local = Path(explicit).expanduser()
+        if local.is_file():
+            return str(local)
+        if local.is_absolute() or local.parent != Path("."):
+            raise RuntimeError(f"quant_file not found: {local}")
+        filename = explicit
+    else:
+        filename = gguf_filename(settings.quant)
+
+    from huggingface_hub import hf_hub_download
+
+    logger.info("resolving %s from %s", filename, settings.quant_repo)
+    return hf_hub_download(settings.quant_repo, filename)
+
+
+def ensure_single_file_loadable(diffusers_mod: Any, cls: Any) -> bool:
+    """Teach ``from_single_file`` about *cls* when diffusers has no entry for it.
+
+    ``FromOriginalModelMixin`` dispatches through ``SINGLE_FILE_LOADABLE_CLASSES``
+    by walking that table for a base class of *cls*.  Qwen-Image-2.1's
+    transformer does not subclass the 1.0 one, so the lookup misses and loading
+    raises — even though the checkpoint needs no key conversion at all: the 297
+    tensors in the GGUF already carry diffusers' own parameter names, which is
+    why the 1.0 entry's mapping function is the identity.  Registering the same
+    entry is therefore exact rather than a guess, and turns into a no-op the day
+    diffusers ships one.
+
+    Returns True when an entry was added.
+    """
+    from diffusers.loaders import single_file_model
+
+    table = single_file_model.SINGLE_FILE_LOADABLE_CLASSES
+    for name in table:
+        known = getattr(diffusers_mod, name, None)
+        if isinstance(known, type) and issubclass(cls, known):
+            return False
+    table[cls.__name__] = {
+        "checkpoint_mapping_fn": lambda checkpoint, **kwargs: checkpoint,
+        "default_subfolder": "transformer",
+    }
+    logger.info("registered %s for single-file loading", cls.__name__)
+    return True
+
+
 def split_kwargs(fn: Any, kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Split *kwargs* into those *fn* accepts and the names it does not.
 
@@ -239,6 +324,8 @@ class QwenImageBackend:
     load_seconds: float | None = None
     pipeline_name: str | None = None  # the class actually instantiated
     edit_pipeline_name: str | None = None
+    transformer_name: str | None = None  # quantized transformer class, when one is used
+    quant_path: str | None = None  # resolved .gguf on disk
     device: str = ""  # resolved from settings.device at load time
     devices: list[dict[str, Any]] = field(default_factory=list)
     _pipe: Any = None
@@ -278,9 +365,17 @@ class QwenImageBackend:
                     + ", ".join(n for n in dir(diffusers) if n.endswith("Pipeline"))[:400]
                 )
 
-        logger.info("loading %s via %s (%s) on %s", s.model, s.pipeline, s.dtype, self.device)
+        dtype = getattr(torch, s.dtype)
+        extra: dict[str, Any] = {}
+        if s.quant != "none" or s.quant_file:
+            extra["transformer"] = self._load_gguf_transformer(diffusers, dtype)
+
+        logger.info(
+            "loading %s via %s (%s, quant=%s) on %s",
+            s.model, s.pipeline, s.dtype, s.quant, self.device,
+        )  # fmt: skip
         try:
-            pipe = pipe_cls.from_pretrained(s.model, torch_dtype=getattr(torch, s.dtype))
+            pipe = pipe_cls.from_pretrained(s.model, torch_dtype=dtype, **extra)
         except ValueError as exc:
             # from_pretrained raises ValueError for many reasons; only an unknown class
             # name means "your diffusers is too old". Attaching that hint to every
@@ -325,6 +420,40 @@ class QwenImageBackend:
         self._place(pipe)
         self._placed = pipe
 
+    def _load_gguf_transformer(self, diffusers: Any, dtype: Any) -> Any:
+        """Build the transformer from a GGUF file instead of the base weights.
+
+        The class to build is read from the checkpoint's ``model_index.json``
+        rather than hardcoded, for the same reason ``pipeline: "auto"`` is the
+        default: Qwen-Image's diffusers classes are still being renamed.
+        """
+        from diffusers import GGUFQuantizationConfig
+
+        s = self.settings
+        index = diffusers.DiffusionPipeline.load_config(s.model)
+        entry = index.get("transformer")
+        if not entry or len(entry) != 2:
+            raise RuntimeError(f"{s.model} declares no transformer in model_index.json")
+        cls = getattr(diffusers, entry[1], None)
+        if cls is None:
+            raise RuntimeError(
+                f"diffusers {diffusers.__version__} has no {entry[1]}, which "
+                f"{s.model} needs; pip install -U git+https://github.com/huggingface/diffusers"
+            )
+        ensure_single_file_loadable(diffusers, cls)
+
+        path = resolve_gguf_path(s)
+        self.quant_path = path
+        self.transformer_name = cls.__name__
+        logger.info("loading %s from %s (compute dtype %s)", cls.__name__, path, s.dtype)
+        return cls.from_single_file(
+            path,
+            quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+            config=s.model,
+            subfolder="transformer",
+            torch_dtype=dtype,
+        )
+
     def _place(self, pipe: Any) -> None:
         """Apply the configured offload strategy, or move the pipeline to the GPU."""
         offload = self.settings.offload
@@ -361,8 +490,12 @@ class QwenImageBackend:
             "model": s.model,
             "pipeline": self.pipeline_name or s.pipeline,
             "edit_pipeline": self.edit_pipeline_name,
+            "transformer": self.transformer_name,
             "dtype": s.dtype,
             "offload": s.offload,
+            # quant_file alone (no --quant) still means a quantized transformer
+            "quant": s.quant if s.quant != "none" else ("custom" if self.quant_path else "none"),
+            "quant_file": self.quant_path,
             "requested_device": s.device,
             "device": self._vram() if self.status == "ready" else s.device,
             "devices": self.devices,
@@ -545,6 +678,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=d.offload,
         help="CPU offload strategy: none needs ~20 GB VRAM, sequential the least (and is slowest)",
     )
+    ap.add_argument(
+        "--quant",
+        choices=["none", *GGUF_QUANTS],
+        default=d.quant,
+        help="load the transformer from a GGUF quantization instead of the bf16 weights",
+    )
+    ap.add_argument(
+        "--quant-repo", default=d.quant_repo, help="Hugging Face repo holding the GGUFs"
+    )
+    ap.add_argument(
+        "--quant-file",
+        default=d.quant_file,
+        help="explicit .gguf path, or a file name inside --quant-repo; overrides --quant",
+    )
     ap.add_argument("--max-images", type=int, default=10)
     ap.add_argument("--max-pixels", type=int, default=2048 * 2048)
     ap.add_argument(
@@ -586,6 +733,9 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             dtype=args.dtype,
             offload=args.offload,
+            quant=args.quant,
+            quant_repo=args.quant_repo,
+            quant_file=args.quant_file,
         )
     )
     activity = Activity()

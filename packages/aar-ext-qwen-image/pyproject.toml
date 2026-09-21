@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aar-ext-qwen-image"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local text-to-image and image editing tools backed by Qwen-Image-2.1"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,9 @@ server = [
   "transformers>=4.56",
   "accelerate",
   "safetensors",
+  # GGUF quantizations of the transformer ("quant" in the config)
+  "gguf>=0.10",
+  "huggingface_hub",
   "pillow",
   "pydantic>=2",
   "fastapi",
@@ -34,6 +37,7 @@ test = ["pytest", "pytest-asyncio", "fastapi"]
 "Home" = "https://github.com/fischerf/aar"
 "Repository" = "https://github.com/fischerf/aar-extensions-registry"
 "Model" = "https://huggingface.co/Qwen/Qwen-Image-2.1"
+"Quantizations" = "https://huggingface.co/abenzerps/Qwen-Image-2.1-GGUF"
 
 [project.entry-points."aar_extensions"]
 qwen_image = "aar_ext_qwen_image:register"

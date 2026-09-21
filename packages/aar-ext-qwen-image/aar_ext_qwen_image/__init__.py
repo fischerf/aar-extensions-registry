@@ -12,7 +12,7 @@ Tools exposed to the model:
 - ``image_generate`` — text to image, saved as a PNG under ``out_dir``
 - ``image_edit``     — edit / combine up to ten reference images
 
-Slash-command ``/qwenimage [status|start|stop|generate <prompt>]``.
+Slash-command ``/qwenimage [status|devices|quant|start|stop|generate <prompt>]``.
 
 Configuration is read from ``~/.aar/qwen-image.json`` (all keys optional)::
 
@@ -22,9 +22,16 @@ Configuration is read from ``~/.aar/qwen-image.json`` (all keys optional)::
       "python": "~/.aar/qwen-image/.venv/Scripts/python.exe",
       "device": "auto",                  // or "cuda:0" / "xpu" / "dml:0" / "cpu"
       "offload": "model",                // "none" | "model" | "sequential"
+      "quant": "none",                   // "none" | "Q8_0" | "Q6_K" | "Q5_K_M" | "Q4_K_M" | "Q4_0"
       "out_dir": "~/.aar/qwen-image/out",
       "tools": ["image_generate", "image_edit"]
     }
+
+``quant`` swaps the 13.3 GiB bf16 transformer for a GGUF quantization of the
+same Qwen-Image-2.1 weights (3.8-7.1 GiB), which is what makes the model
+comfortable on a 24 GB card.  The text encoder and VAE are untouched and still
+come from the base checkpoint.  Switch at runtime with ``/qwenimage quant
+<name>``; it takes effect on the next server start.
 
 The server may also live behind a *launcher* — an argv prefix such as
 ``["wsl.exe", "-d", "Ubuntu", "--"]`` — which is how an AMD GPU is reached from
@@ -61,6 +68,22 @@ import httpx
 
 SERVER_SCRIPT = Path(__file__).with_name("server.py")
 ALL_TOOLS = ("image_generate", "image_edit")
+
+# GGUF quantizations of the *transformer* only, largest first.  Sizes are the
+# files in GGUF_REPO in GiB, to match how VRAM is counted everywhere else here —
+# the model card lists the same files in decimal GB, so its numbers run ~7%
+# higher.  They replace a 13.3 GiB bf16 transformer, so the saving is 6-9 GiB of
+# VRAM (and of host memory under `offload: "model"`).  The text encoder and VAE
+# are unquantized and still come from the base checkpoint.
+GGUF_QUANTS: dict[str, tuple[float, str]] = {
+    "Q8_0": (7.1, "closest to bf16"),
+    "Q6_K": (5.5, ""),
+    "Q5_K_M": (4.9, ""),
+    "Q4_K_M": (4.3, "recommended"),
+    "Q4_0": (3.8, "smallest"),
+}
+GGUF_REPO = "abenzerps/Qwen-Image-2.1-GGUF"
+BF16_TRANSFORMER_GIB = 13.3
 MAX_REF_IMAGES = 10  # Qwen-Image-2.1 accepts up to ten reference images
 MAX_INPUT_BYTES = 24 * 1024 * 1024  # per reference image
 INPUT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -84,6 +107,45 @@ ASPECT_RATIOS: dict[str, tuple[int, int]] = {
 }
 
 
+def config_path() -> Path:
+    """Where the extension's settings live (``AAR_QWEN_IMAGE_CONFIG`` wins)."""
+    env_path = os.environ.get("AAR_QWEN_IMAGE_CONFIG")
+    return Path(env_path) if env_path else Path.home() / ".aar" / "qwen-image.json"
+
+
+def write_config_key(path: Path, key: str, value: Any) -> None:
+    """Persist one setting into the JSON config, leaving every other key alone."""
+    raw: dict[str, Any] = {}
+    if path.is_file():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    raw[key] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def normalise_quant(name: str) -> str | None:
+    """Map a user-typed quantization label onto a config value, or ``None``.
+
+    Accepts the labels as the model card writes them (``Q4_K_M``) in any case
+    and with dashes, plus the obvious ways of asking for the unquantized
+    weights.
+    """
+    key = name.strip().upper().replace("-", "_")
+    if key in ("", "NONE", "OFF", "FULL", "BF16"):
+        return "none"
+    return key if key in GGUF_QUANTS else None
+
+
+def describe_quant(quant: str) -> str:
+    """One-line description of a quantization setting, for status output."""
+    if quant == "none":
+        return f"none (full bf16 transformer, {BF16_TRANSFORMER_GIB} GiB)"
+    if quant not in GGUF_QUANTS:
+        return quant
+    size, note = GGUF_QUANTS[quant]
+    return f"{quant} (GGUF, {size} GiB{', ' + note if note else ''})"
+
+
 def _default_python() -> str:
     venv = Path.home() / ".aar" / "qwen-image" / ".venv"
     return str(venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
@@ -105,6 +167,9 @@ class QwenImageConfig:
     device: str = "auto"  # "auto" | "cuda:N" (NVIDIA or AMD/ROCm) | "xpu" | "mps" | "dml:N" | "cpu"
     dtype: str = "bfloat16"
     offload: str = "model"  # "none" | "model" | "sequential"
+    quant: str = "none"  # "none" (full bf16) or a key of GGUF_QUANTS
+    quant_repo: str = GGUF_REPO
+    quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
     cuda_visible_devices: str | None = None
     hip_visible_devices: str | None = None  # ROCm's equivalent, for multi-GPU AMD boxes
     launcher: list[str] = field(default_factory=list)  # argv prefix, e.g. ["wsl.exe", "-d", "roc"]
@@ -125,8 +190,7 @@ class QwenImageConfig:
 
     @classmethod
     def load(cls, path: Path | None = None) -> QwenImageConfig:
-        env_path = os.environ.get("AAR_QWEN_IMAGE_CONFIG")
-        path = path or (Path(env_path) if env_path else Path.home() / ".aar" / "qwen-image.json")
+        path = path or config_path()
         raw: dict[str, Any] = {}
         if path.is_file():
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -141,6 +205,10 @@ class QwenImageConfig:
             raise ValueError(f"autostart must be on_demand, session or off, got {cfg.autostart!r}")
         if cfg.offload not in ("none", "model", "sequential"):
             raise ValueError(f"offload must be none, model or sequential, got {cfg.offload!r}")
+        if cfg.quant not in ("none", *GGUF_QUANTS):
+            raise ValueError(
+                f"quant must be none or one of {', '.join(GGUF_QUANTS)}, got {cfg.quant!r}"
+            )
         return cfg
 
     @property
@@ -279,7 +347,7 @@ class QwenImageClient:
     def server_command(self) -> list[str]:
         cfg = self.config
         parts = urlsplit(cfg.url)
-        return [
+        cmd = [
             *cfg.launcher,
             cfg.python if cfg.launcher else str(cfg.python_path),
             cfg.server_script or str(SERVER_SCRIPT),
@@ -292,7 +360,12 @@ class QwenImageClient:
             "--max-pixels", str(cfg.max_pixels),
             "--max-images", str(MAX_REF_IMAGES),
             "--idle-timeout", str(cfg.idle_timeout),
+            "--quant", cfg.quant,
+            "--quant-repo", cfg.quant_repo,
         ]  # fmt: skip
+        if cfg.quant_file:
+            cmd += ["--quant-file", cfg.quant_file]
+        return cmd
 
     def start(self) -> None:
         """Launch the server detached, so it outlives this aar process.
@@ -723,7 +796,10 @@ def register(
 
     @api.command(
         "qwenimage",
-        description="Qwen-Image server: status | devices | start | stop | generate <prompt>",
+        description=(
+            "Qwen-Image server: status | devices | quant [<name>] | start | stop | "
+            "generate <prompt>"
+        ),
     )
     def qwenimage_command(args: str, ctx: Any) -> str:
         sub, _, rest = (args or "").strip().partition(" ")
@@ -731,8 +807,11 @@ def register(
 
         if sub == "status":
             state = qwen.health()
+            # A running server keeps the quant it was started with, which is not
+            # necessarily the one now in the config.
             lines = [
                 f"url:     {cfg.url}",
+                f"quant:   {describe_quant((state or {}).get('quant') or cfg.quant)}",
                 f"tools:   {', '.join(enabled) or '(none)'}",
                 f"out:     {cfg.out_path}",
             ]
@@ -772,6 +851,37 @@ def register(
             ]
             return f"in use: {state.get('device')}\n" + "\n".join(rows)
 
+        if sub == "quant":
+            choice = normalise_quant(rest) if rest.strip() else None
+            if choice is None and rest.strip():
+                return (
+                    f"qwen-image: unknown quantization {rest.strip()!r} — "
+                    f"one of: none, {', '.join(GGUF_QUANTS)}"
+                )
+            if choice is None:  # no argument: show the menu
+                rows = [("none", BF16_TRANSFORMER_GIB, "full bf16 transformer")]
+                rows += [(name, gb, note) for name, (gb, note) in GGUF_QUANTS.items()]
+                lines = [
+                    f"{'*' if name == cfg.quant else ' '} {name:<8} {gb:>5.1f} GiB  {note}".rstrip()
+                    for name, gb, note in rows
+                ]
+                return "\n".join(
+                    [f"repo:    {cfg.quant_repo}", *lines, "", "switch: /qwenimage quant <name>"]
+                )
+            if choice == cfg.quant:
+                return f"qwen-image: already set to {describe_quant(choice)}"
+            try:
+                write_config_key(config_path(), "quant", choice)
+            except (OSError, ValueError) as exc:
+                return f"qwen-image: cannot write {config_path()}: {exc}"
+            cfg.quant = choice
+            tail = (
+                " — restart to apply: /qwenimage stop, then /qwenimage start"
+                if qwen.health() is not None
+                else ""
+            )
+            return f"qwen-image: quant set to {describe_quant(choice)}{tail}"
+
         if sub == "start":
             if qwen.health() is not None:
                 return "qwen-image: already running — /qwenimage status"
@@ -808,4 +918,7 @@ def register(
                 return f"qwen-image: {exc}"
             return format_result(path, result)
 
-        return "usage: /qwenimage [status | devices | start | stop | generate <prompt>]"
+        return (
+            "usage: /qwenimage "
+            "[status | devices | quant [<name>] | start | stop | generate <prompt>]"
+        )

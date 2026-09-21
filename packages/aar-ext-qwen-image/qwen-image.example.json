@@ -8,6 +8,9 @@
   "device": "auto",
   "dtype": "bfloat16",
   "offload": "model",
+  "quant": "none",
+  "quant_repo": "abenzerps/Qwen-Image-2.1-GGUF",
+  "quant_file": null,
   "cuda_visible_devices": null,
   "hip_visible_devices": null,
   "out_dir": "~/.aar/qwen-image/out",
@@ -20,5 +23,8 @@
   "request_timeout": 900,
   "max_pixels": 4194304,
   "log_file": "~/.aar/qwen-image/server.log",
-  "tools": ["image_generate", "image_edit"]
+  "tools": [
+    "image_generate",
+    "image_edit"
+  ]
 }

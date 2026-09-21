@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -13,8 +15,11 @@ import httpx
 import pytest
 from aar_ext_qwen_image import (
     ASPECT_RATIOS,
+    GGUF_QUANTS,
     apply_rgba_prompt,
+    describe_quant,
     MAX_REF_IMAGES,
+    normalise_quant,
     QwenImageClient,
     QwenImageConfig,
     format_result,
@@ -76,6 +81,7 @@ class FakeServer:
     def __init__(self, status: str = "ready", mode: str = "RGB") -> None:
         self.status = status
         self.mode = mode
+        self.quant = "none"
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.shutdowns = 0
 
@@ -87,6 +93,7 @@ class FakeServer:
                 json={
                     "status": self.status,
                     "model": "Qwen/Qwen-Image-2.1",
+                    "quant": self.quant,
                     "dtype": "bfloat16",
                     "offload": "model",
                     "requested_device": "cuda:0",
@@ -468,6 +475,81 @@ def test_split_kwargs_accepts_everything_with_var_keyword() -> None:
     assert ignored == [] and accepted == {"prompt": "x", "whatever": 1}
 
 
+# ---------------------------------------------------------------------------
+# Server: resolving the GGUF transformer
+#
+# The abenzerps GGUFs carry diffusers' own parameter names, so no key conversion
+# is needed — but QwenImage21Transformer2DModel is not a subclass of the 1.0
+# transformer, so diffusers' single-file lookup misses it and has to be taught.
+# ---------------------------------------------------------------------------
+
+
+def test_gguf_filename_matches_the_repo_layout() -> None:
+    from aar_ext_qwen_image.server import gguf_filename
+
+    assert gguf_filename("Q4_K_M") == "qwen-image-2.1-Q4_K_M.gguf"
+    assert gguf_filename("Q8_0") == "qwen-image-2.1-Q8_0.gguf"
+    with pytest.raises(ValueError, match="quant must be none or one of"):
+        gguf_filename("Q3_K")
+
+
+def test_resolve_gguf_path_prefers_a_file_already_on_disk(tmp_path: Path) -> None:
+    from aar_ext_qwen_image.server import ModelSettings, resolve_gguf_path
+
+    local = tmp_path / "custom.gguf"
+    local.write_bytes(b"GGUF")
+    # No network: an existing path short-circuits the hub download.
+    assert resolve_gguf_path(ModelSettings(quant_file=str(local))) == str(local)
+
+
+def test_resolve_gguf_path_reports_a_missing_local_file(tmp_path: Path) -> None:
+    from aar_ext_qwen_image.server import ModelSettings, resolve_gguf_path
+
+    missing = tmp_path / "nope.gguf"
+    with pytest.raises(RuntimeError, match="quant_file not found"):
+        resolve_gguf_path(ModelSettings(quant_file=str(missing)))
+
+
+def test_ensure_single_file_loadable_registers_only_unknown_classes(monkeypatch) -> None:
+    """Fakes diffusers: this pins our shim, not the library's table."""
+    from aar_ext_qwen_image.server import ensure_single_file_loadable
+
+    class Known:
+        pass
+
+    class Subclass(Known):
+        pass
+
+    class Unknown:
+        pass
+
+    table: dict[str, Any] = {"Known": {"checkpoint_mapping_fn": lambda ckpt, **kw: ckpt}}
+    single_file_model = ModuleType("diffusers.loaders.single_file_model")
+    single_file_model.SINGLE_FILE_LOADABLE_CLASSES = table
+    loaders = ModuleType("diffusers.loaders")
+    loaders.single_file_model = single_file_model
+    diffusers = ModuleType("diffusers")
+    diffusers.loaders = loaders
+    diffusers.Known = Known
+    for name, mod in [
+        ("diffusers", diffusers),
+        ("diffusers.loaders", loaders),
+        ("diffusers.loaders.single_file_model", single_file_model),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    # a subclass of a registered class already dispatches — leave the table alone
+    assert ensure_single_file_loadable(diffusers, Subclass) is False
+    assert "Subclass" not in table
+
+    assert ensure_single_file_loadable(diffusers, Unknown) is True
+    entry = table["Unknown"]
+    assert entry["default_subfolder"] == "transformer"
+    # the mapping is the identity: the GGUF's keys are already diffusers' own
+    state_dict = {"transformer_blocks.0.attn.to_q.weight": 1}
+    assert entry["checkpoint_mapping_fn"](state_dict) is state_dict
+
+
 class FakeBackend:
     def __init__(self, status: str = "ready") -> None:
         self.status = status
@@ -540,6 +622,112 @@ def test_server_shutdown_calls_hook() -> None:
     client = _server_app(FakeBackend(), on_shutdown=lambda: called.append(True))
     assert client.post("/shutdown").json() == {"status": "stopping"}
     assert called == [True]
+
+
+# ---------------------------------------------------------------------------
+# GGUF quantization switch
+#
+# The GGUF files hold only the transformer (4.1-7.6 GB instead of 13.3 GB); the
+# text encoder and VAE still come from the base checkpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_config_defaults_to_unquantized_weights(tmp_path: Path) -> None:
+    cfg = QwenImageConfig.load(tmp_path / "missing.json")
+    assert cfg.quant == "none"
+    assert cfg.quant_file is None
+    assert cfg.quant_repo == "abenzerps/Qwen-Image-2.1-GGUF"
+
+
+def test_config_rejects_bad_quant(tmp_path: Path) -> None:
+    path = tmp_path / "qwen-image.json"
+    path.write_text(json.dumps({"quant": "Q3"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="quant must be none or one of"):
+        QwenImageConfig.load(path)
+
+
+@pytest.mark.parametrize(
+    "typed, expected",
+    [
+        ("Q4_K_M", "Q4_K_M"),
+        ("q4_k_m", "Q4_K_M"),
+        ("q4-k-m", "Q4_K_M"),
+        (" Q8_0 ", "Q8_0"),
+        ("none", "none"),
+        ("bf16", "none"),
+        ("off", "none"),
+        ("Q3_K_S", None),
+    ],
+)
+def test_normalise_quant(typed: str, expected: str | None) -> None:
+    assert normalise_quant(typed) == expected
+
+
+def test_server_command_passes_the_quant_through() -> None:
+    _, client = make(None, quant="Q4_K_M")
+    cmd = client.server_command()
+    assert cmd[cmd.index("--quant") + 1] == "Q4_K_M"
+    assert cmd[cmd.index("--quant-repo") + 1] == "abenzerps/Qwen-Image-2.1-GGUF"
+    assert "--quant-file" not in cmd
+
+
+def test_server_command_includes_an_explicit_quant_file() -> None:
+    _, client = make(None, quant_file="/models/custom.gguf")
+    cmd = client.server_command()
+    assert cmd[cmd.index("--quant-file") + 1] == "/models/custom.gguf"
+
+
+def test_command_quant_lists_every_option(tmp_path: Path) -> None:
+    api, _ = make(None, out_dir=str(tmp_path))
+    out = api.commands["qwenimage"]("quant", MagicMock())
+    for name in GGUF_QUANTS:
+        assert name in out
+    assert "* none" in out  # the default is marked as active
+    assert "13.3 GiB" in out
+
+
+def test_command_quant_persists_the_choice(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "qwen-image.json"
+    path.write_text(json.dumps({"steps": 25}), encoding="utf-8")
+    monkeypatch.setenv("AAR_QWEN_IMAGE_CONFIG", str(path))
+
+    api, client = make(None, out_dir=str(tmp_path), steps=25)
+    out = api.commands["qwenimage"]("quant q4_k_m", MagicMock())
+
+    assert "Q4_K_M" in out
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved == {"steps": 25, "quant": "Q4_K_M"}  # other keys survive
+    # the live config follows, so the next start uses it without a reload
+    assert client.config.quant == "Q4_K_M"
+    assert client.server_command()[client.server_command().index("--quant") + 1] == "Q4_K_M"
+
+
+def test_command_quant_asks_for_a_restart_when_running(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AAR_QWEN_IMAGE_CONFIG", str(tmp_path / "qwen-image.json"))
+    api, _ = make(FakeServer(), out_dir=str(tmp_path))
+    out = api.commands["qwenimage"]("quant Q8_0", MagicMock())
+    assert "restart to apply" in out
+
+
+def test_command_quant_rejects_an_unknown_label(tmp_path: Path) -> None:
+    api, _ = make(None, out_dir=str(tmp_path))
+    out = api.commands["qwenimage"]("quant Q2_K", MagicMock())
+    assert out.startswith("qwen-image: unknown quantization")
+    assert "Q4_K_M" in out
+
+
+def test_status_reports_the_quant_the_server_actually_loaded(tmp_path: Path) -> None:
+    """A running server keeps the quant it started with, not the one in the config."""
+    server = FakeServer()
+    server.quant = "Q4_K_M"
+    api, _ = make(server, out_dir=str(tmp_path), quant="Q8_0")
+    assert "Q4_K_M" in api.commands["qwenimage"]("status", MagicMock())
+
+
+def test_describe_quant() -> None:
+    assert describe_quant("none").startswith("none (full bf16")
+    assert describe_quant("Q4_K_M") == "Q4_K_M (GGUF, 4.3 GiB, recommended)"
+    assert describe_quant("custom") == "custom"
 
 
 # ---------------------------------------------------------------------------

@@ -98,7 +98,7 @@
     {
       "name": "qwen-image",
       "pypi": "aar-ext-qwen-image",
-      "description": "Local text-to-image and image editing tools backed by Qwen-Image-2.1 (diffusers sidecar server, NVIDIA or AMD/ROCm)",
+      "description": "Local text-to-image and image editing tools backed by Qwen-Image-2.1, bf16 or GGUF-quantized (diffusers sidecar server, NVIDIA or AMD/ROCm)",
       "tags": ["tool"],
       "author": "Aar Team",
       "repository": "https://github.com/fischerf/aar-extensions-registry",
