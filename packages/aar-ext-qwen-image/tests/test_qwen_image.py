@@ -550,6 +550,21 @@ def test_ensure_single_file_loadable_registers_only_unknown_classes(monkeypatch)
     assert entry["checkpoint_mapping_fn"](state_dict) is state_dict
 
 
+def test_gguf_config_eagerly_dequantizes_custom_norms() -> None:
+    from aar_ext_qwen_image.server import gguf_quantization_config
+
+    class FakeConfig:
+        def __init__(self, compute_dtype: Any) -> None:
+            self.compute_dtype = compute_dtype
+            self.modules_to_not_convert: list[str] | None = None
+
+    diffusers = MagicMock(GGUFQuantizationConfig=FakeConfig)
+    config = gguf_quantization_config(diffusers, "bfloat16")
+
+    assert config.compute_dtype == "bfloat16"
+    assert config.modules_to_not_convert == ["text_norm", "norm_q", "norm_k"]
+
+
 class FakeBackend:
     def __init__(self, status: str = "ready") -> None:
         self.status = status

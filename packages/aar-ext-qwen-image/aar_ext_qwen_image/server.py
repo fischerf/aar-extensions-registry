@@ -86,6 +86,10 @@ MAX_SEED = 2**31 - 1
 GGUF_QUANTS = ("Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_0")
 GGUF_REPO = "abenzerps/Qwen-Image-2.1-GGUF"
 GGUF_FILE_TEMPLATE = "qwen-image-2.1-{quant}.gguf"
+# Diffusers' GGUF runtime dequantizes nn.Linear weights on demand. These Qwen
+# modules are custom normalization layers, so their packed BF16 weights must be
+# decoded eagerly instead of being installed as raw GGUFParameter byte tensors.
+GGUF_EAGER_DEQUANT_MODULES = ("text_norm", "norm_q", "norm_k")
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +282,13 @@ def ensure_single_file_loadable(diffusers_mod: Any, cls: Any) -> bool:
     return True
 
 
+def gguf_quantization_config(diffusers_mod: Any, dtype: Any) -> Any:
+    """Build a GGUF config that eagerly decodes Qwen's non-linear norm weights."""
+    config = diffusers_mod.GGUFQuantizationConfig(compute_dtype=dtype)
+    config.modules_to_not_convert = list(GGUF_EAGER_DEQUANT_MODULES)
+    return config
+
+
 def split_kwargs(fn: Any, kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Split *kwargs* into those *fn* accepts and the names it does not.
 
@@ -427,8 +438,6 @@ class QwenImageBackend:
         rather than hardcoded, for the same reason ``pipeline: "auto"`` is the
         default: Qwen-Image's diffusers classes are still being renamed.
         """
-        from diffusers import GGUFQuantizationConfig
-
         s = self.settings
         index = diffusers.DiffusionPipeline.load_config(s.model)
         entry = index.get("transformer")
@@ -448,7 +457,7 @@ class QwenImageBackend:
         logger.info("loading %s from %s (compute dtype %s)", cls.__name__, path, s.dtype)
         return cls.from_single_file(
             path,
-            quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
+            quantization_config=gguf_quantization_config(diffusers, dtype),
             config=s.model,
             subfolder="transformer",
             torch_dtype=dtype,
@@ -625,6 +634,7 @@ def create_app(
         except ValueError as exc:  # unreadable reference image
             raise HTTPException(422, detail=str(exc)) from exc
         except RuntimeError as exc:
+            logger.exception("render failed")
             raise HTTPException(500, detail=str(exc)) from exc
         finally:
             activity.touch()
