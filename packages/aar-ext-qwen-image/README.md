@@ -28,19 +28,38 @@ card.
 
 Both tools return a **file path**, because aar tool results are plain strings — the
 model never sees the pixels. To let it look at its own output, attach the file back
-with `@~/.aar/qwen-image/out/foo.png` on a vision-capable provider.
+with `@foo.png` on a vision-capable provider.
 
 Output names are constrained: `out` must be a bare file name, it always lands inside
 the configured `out_dir`, the suffix is forced to `.png`, and an existing file is
 never overwritten (`sunset.png` → `sunset-1.png`).
+
+### Where images are saved
+
+`out_dir` is empty by default, which means **aar's current working directory** — run
+`aar` in a project and `image_generate` drops the PNG right there. Set it in
+`~/.aar/qwen-image.json` to change that:
+
+```jsonc
+{
+  "out_dir": ""                 // default: aar's cwd
+  "out_dir": "images"           // ./images under aar's cwd
+  "out_dir": "assets/renders"   // nested subdirectory of aar's cwd
+  "out_dir": "~/.aar/qwen-image/out"   // fixed location, regardless of cwd
+}
+```
+
+Anything that is not absolute (and does not start with `~`) is taken relative to the
+working directory aar was started in, and is created on the first render. The cwd is
+read at render time, so the same relative setting follows you from project to project.
 
 Reference images for `image_edit` are accepted in the three forms a model actually
 produces:
 
 | form | example |
 |---|---|
-| full or `~` path | `~/.aar/qwen-image/out/neon.png` |
-| aar's attachment syntax | `@~/.aar/qwen-image/out/neon.png` — the leading `@` is stripped |
+| full or `~` path | `~/pics/neon.png` |
+| aar's attachment syntax | `@~/pics/neon.png` — the leading `@` is stripped |
 | bare file name | `neon.png` — resolved against `out_dir`, where `image_generate` writes |
 
 The second matters because when a user writes `@some/pic.png` the model passes that
@@ -537,7 +556,7 @@ cp packages/aar-ext-qwen-image/qwen-image.example.json ~/.aar/qwen-image.json
 | `launcher` | `[]` | argv prefix for the server, e.g. `["wsl.exe", "-d", "Ubuntu-24.04", "--"]` |
 | `server_script` | `null` | path to `server.py` as the launcher sees it |
 | `cuda_visible_devices` / `hip_visible_devices` | `null` | set to hide other cards from the server |
-| `out_dir` | `~/.aar/qwen-image/out` | every generated PNG lands here |
+| `out_dir` | `""` | where generated PNGs land: empty = aar's current working directory, a relative path like `images` or `assets/renders` = that subdirectory of the cwd, an absolute or `~` path = exactly that directory (created on first render) |
 | `width` / `height` / `steps` | `1024` / `1024` / `30` | the model card's example uses 2048px and 40 steps |
 | `max_pixels` | `4300800` (2400x1792) | requests above this are refused before reaching the GPU; covers every documented aspect ratio |
 | `idle_timeout` | `900` | server exits after this many idle seconds (0 = never), like Ollama's `keep_alive` |

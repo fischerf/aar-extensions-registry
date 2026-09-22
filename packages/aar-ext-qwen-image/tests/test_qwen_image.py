@@ -234,6 +234,24 @@ async def test_missing_local_interpreter_is_reported(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_out_path_defaults_to_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert QwenImageConfig().out_path == Path.cwd()
+
+
+def test_out_path_relative_is_a_cwd_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert QwenImageConfig(out_dir="assets/renders").out_path == Path.cwd() / "assets" / "renders"
+
+
+def test_out_path_absolute_ignores_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    fixed = tmp_path.parent / "fixed"
+    assert QwenImageConfig(out_dir=str(fixed)).out_path == fixed
+
+
 def test_resolve_out_path_defaults_to_timestamp(tmp_path: Path) -> None:
     path = resolve_out_path(tmp_path, None)
     assert path.parent == tmp_path

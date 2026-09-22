@@ -13,7 +13,7 @@
   "quant_file": null,
   "cuda_visible_devices": null,
   "hip_visible_devices": null,
-  "out_dir": "~/.aar/qwen-image/out",
+  "out_dir": "",
   "width": 1024,
   "height": 1024,
   "steps": 30,

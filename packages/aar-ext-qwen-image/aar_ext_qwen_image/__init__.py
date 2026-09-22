@@ -10,6 +10,7 @@ heavy ML stack.
 Tools exposed to the model:
 
 - ``image_generate`` — text to image, saved as a PNG under ``out_dir``
+  (aar's current working directory unless ``out_dir`` says otherwise)
 - ``image_edit``     — edit / combine up to ten reference images
 
 Slash-command ``/qwenimage [status|devices|quant|start|stop|generate <prompt>]``.
@@ -23,7 +24,7 @@ Configuration is read from ``~/.aar/qwen-image.json`` (all keys optional)::
       "device": "auto",                  // or "cuda:0" / "xpu" / "dml:0" / "cpu"
       "offload": "model",                // "none" | "model" | "sequential"
       "quant": "none",                   // "none" | "Q8_0" | "Q6_K" | "Q5_K_M" | "Q4_K_M" | "Q4_0"
-      "out_dir": "~/.aar/qwen-image/out",
+      "out_dir": "images",              // relative -> under aar's cwd; "" = cwd itself
       "tools": ["image_generate", "image_edit"]
     }
 
@@ -174,7 +175,10 @@ class QwenImageConfig:
     hip_visible_devices: str | None = None  # ROCm's equivalent, for multi-GPU AMD boxes
     launcher: list[str] = field(default_factory=list)  # argv prefix, e.g. ["wsl.exe", "-d", "roc"]
     server_script: str | None = None  # path to server.py *as the launcher sees it*
-    out_dir: str = "~/.aar/qwen-image/out"
+    # Empty means aar's current working directory; a relative path is taken
+    # relative to it, so "images" writes into ./images next to whatever the
+    # user is working on.  Absolute and ``~``-paths are used as given.
+    out_dir: str = ""
     width: int = 1024  # the model card's example uses 2048; 1024 is kinder to small GPUs
     height: int = 1024
     steps: int = 30  # model card default is 40
@@ -221,7 +225,17 @@ class QwenImageConfig:
 
     @property
     def out_path(self) -> Path:
-        return Path(self.out_dir).expanduser()
+        """Absolute directory the rendered PNGs land in.
+
+        Anchored on the *current* working directory rather than resolved once at
+        load time: aar can be started anywhere, and an unconfigured ``out_dir``
+        should follow the project the user is in.
+        """
+        raw = self.out_dir.strip()
+        if not raw:
+            return Path.cwd()
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
 
 
 # ---------------------------------------------------------------------------
