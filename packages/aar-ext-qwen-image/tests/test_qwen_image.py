@@ -707,6 +707,17 @@ def test_normalise_quant(typed: str, expected: str | None) -> None:
     assert normalise_quant(typed) == expected
 
 
+def test_resident_components_are_empty_by_default() -> None:
+    _, client = make(None)
+    assert "--resident" not in client.server_command()
+
+
+def test_resident_components_reach_the_server_command() -> None:
+    _, client = make(None, resident_components=["transformer", "vae"])
+    cmd = client.server_command()
+    assert cmd[cmd.index("--resident") + 1] == "transformer,vae"
+
+
 def test_memory_savers_are_off_by_default() -> None:
     _, client = make(None)
     cmd = client.server_command()
@@ -1006,3 +1017,87 @@ async def test_image_edit_still_reports_a_genuinely_missing_file(tmp_path: Path)
 def test_read_input_image_rejects_empty_after_stripping_at(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="empty reference image path"):
         read_input_image("@", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-component placement (server side)
+#
+# ``_exclude_from_cpu_offload`` is diffusers' own hook: names listed there are
+# moved onto the device once and left, while everything else gets offload hooks.
+# ---------------------------------------------------------------------------
+
+
+class _FakePipe:
+    def __init__(self, components):
+        self.components = components
+        self._exclude_from_cpu_offload = []
+        self.model_cpu_offload_seq = "text_encoder->transformer->vae"
+
+
+def _backend(**settings):
+    from aar_ext_qwen_image.server import ModelSettings, QwenImageBackend
+
+    return QwenImageBackend(ModelSettings(**settings))
+
+
+def _pipe_with_modules():
+    """A pipeline whose weight-bearing entries are real (empty) nn.Modules."""
+    import torch
+
+    mods = {name: torch.nn.Linear(1, 1) for name in ("transformer", "vae", "text_encoder")}
+    mods["tokenizer"] = object()  # not a module — must never be pinned
+    return _FakePipe(mods)
+
+
+def test_pin_resident_excludes_named_components() -> None:
+    pytest.importorskip("torch")
+    backend = _backend(resident=("transformer", "vae"))
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe._exclude_from_cpu_offload == ["transformer", "vae"]
+    assert backend.resident_applied == ("transformer", "vae")
+
+
+def test_pin_resident_removes_them_from_the_offload_chain() -> None:
+    """Without this the exclusion list is a silent no-op: diffusers only honours
+    it for components outside ``model_cpu_offload_seq``."""
+    pytest.importorskip("torch")
+    backend = _backend(resident=("transformer", "vae"))
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe.model_cpu_offload_seq == "text_encoder"
+
+
+def test_pin_resident_leaves_the_chain_alone_when_unset() -> None:
+    pytest.importorskip("torch")
+    backend = _backend()
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe.model_cpu_offload_seq == "text_encoder->transformer->vae"
+
+
+def test_pin_resident_drops_unknown_names_instead_of_raising() -> None:
+    """Component names differ between pipeline classes; a stale entry must not
+    stop the server from starting."""
+    pytest.importorskip("torch")
+    backend = _backend(resident=("transformer", "unet"))
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe._exclude_from_cpu_offload == ["transformer"]
+    assert backend.resident_applied == ("transformer",)
+
+
+def test_pin_resident_ignores_non_modules() -> None:
+    pytest.importorskip("torch")
+    backend = _backend(resident=("tokenizer",))
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe._exclude_from_cpu_offload == []
+
+
+def test_pin_resident_is_a_noop_when_unset() -> None:
+    pytest.importorskip("torch")
+    backend = _backend()
+    pipe = _pipe_with_modules()
+    backend._pin_resident(pipe)
+    assert pipe._exclude_from_cpu_offload == []

@@ -195,15 +195,64 @@ Two things dominate and are easy to misread:
 - **Encode and VAE decode add minutes**, independent of step count. At 8 steps they are
   most of the wall clock; at 30 steps they are roughly half.
 
-Size timeouts from the *total*, not from s/step. `request_timeout` must exceed the whole
-render, and aar's own `tools.command_timeout` (default **300 s**) must exceed it too —
-otherwise the executor cancels the tool call while the GPU keeps working, and the
-finished image is thrown away. For `image_edit` at 1024px, 300 s is not enough:
+Size timeouts from the *total*, not from s/step: `request_timeout` must exceed the whole
+render. The tools declare `timeout_s = request_timeout + 30` on their `ToolSpec`, so
+aar's shared `tools.command_timeout` (default **300 s**) no longer clips them — without
+that, the executor would cancel the tool call while the GPU kept working and the
+finished image would be thrown away. If you are running an older aar that lacks
+per-tool timeouts, raise the shared cap instead:
 
 ```jsonc
 // ~/.aar/config.json
 { "tools": { "command_timeout": 1800 } }
 ```
+
+### Keeping the model in VRAM
+
+`offload: "model"` (the default) is diffusers' `enable_model_cpu_offload`: weights live
+in system RAM and each component is moved onto the card as the pipeline reaches it, then
+back. **VRAM reading near-zero between renders is that working, not a leak.**
+
+On a PCIe x16 slot the shuffling is cheap. Over **Thunderbolt 3 to an eGPU** (~2.5 GB/s
+against x16's ~25) it is not, and two separate costs appear:
+
+| cost | fix |
+|---|---|
+| The server exiting and rebuilding the pipeline (~140 s) | `"idle_timeout": 0` — never exit. Safe with any offload mode, no downside beyond a resident process |
+| Re-sending components every render | `offload` / `resident_components` — see below |
+
+Measured on an RX 7900 XTX (24 GB), 1024x512, 30 steps, Q4_K_M:
+
+| configuration | idle VRAM | render |
+|---|---|---|
+| `offload: "model"`, nothing pinned | 0.04 GB | **153 s** |
+| `resident_components: ["transformer", "vae"]` | 5.03 GB | 209 s / 199 s |
+| `resident_components: ["text_encoder"]` | 16.38 GB | 202 s / 206 s |
+| `offload: "none"` | 21.4 GB | 87 s once, then 336 s/step — not reproducible |
+
+**On a 24 GB card, plain eviction wins.** Everything pinned is headroom the activations
+no longer have, and the spill crosses the same slow bus you were trying to avoid. With
+`offload: "none"` the pipeline occupies 21.4 of 24 GB and the outcome flips on
+fragmentation you cannot see — the same server that rendered in 87 s later took 336 s
+*per step* for the same size, with no error, just a crawl.
+
+One more trap specific to `resident_components`: pinning the transformer collapses
+diffusers' `model_cpu_offload_seq` to a single entry, and a module is only evicted when
+the *next* one in the chain runs. With nothing after it, the ~15 GB text encoder stays on
+the card for the whole denoise — the opposite of what pinning was meant to achieve. The
+server removes pinned names from the chain so the exclusion list is honoured at all, but
+it cannot conjure headroom that is not there.
+
+So: set `idle_timeout: 0`, keep `offload: "model"`, and reach for `resident_components`
+only on a card whose resident footprint is under roughly half its VRAM. The two-GPU
+setup this pairs with — renderer on one card, chat model on the other — is written up in
+[`docs/sprite-sheet-workflow.md`](../../../docs/sprite-sheet-workflow.md#two-gpus-two-jobs).
+
+**The remaining lever is size, not placement.** With Q4_K_M the transformer is ~4.5 GB —
+the bulk of the 21.4 GB is the *unquantized text encoder*, which runs once per render and
+then idles for 30 steps. Quantizing it to 4-bit (~4 GB) would put the pipeline near 10 GB
+and leave ~14 GB for activations, making `offload: "none"` comfortable at any supported
+size. That needs a quantization backend this server does not wire up yet.
 
 ### AMD on Windows: native ROCm (no WSL)
 
@@ -679,6 +728,7 @@ cp packages/aar-ext-qwen-image/qwen-image.example.json ~/.aar/qwen-image.json
 | `width` / `height` / `steps` | `1024` / `1024` / `30` | the model card's example uses 2048px and 40 steps |
 | `max_pixels` | `4300800` (2400x1792) | requests above this are refused before reaching the GPU; covers every documented aspect ratio |
 | `idle_timeout` | `900` | server exits after this many idle seconds (**0 = never** — set this on a slow bus / eGPU, where rebuilding the pipeline costs ~2 minutes) |
+| `resident_components` | `[]` | Pipeline components pinned to the GPU instead of being offloaded, e.g. `["transformer", "vae"]`. Only meaningful with `offload` `model`/`sequential`. Pays off when the card has headroom to spare; on a 24 GB card with this pipeline it is slower than plain eviction |
 | `vae_tiling` / `vae_slicing` / `attention_slicing` | `false` | Opt-in activation-memory reducers, applied after placement. They lower the per-step peak rather than the weight footprint, so they matter with `offload: "none"`. Best-effort: a helper this pipeline lacks logs a warning instead of failing to start |
 | `request_timeout` | `900` | a large image on an offloaded GPU takes minutes |
 | `tools` | all | subset of tools to expose to the model |

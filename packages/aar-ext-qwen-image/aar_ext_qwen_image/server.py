@@ -7,6 +7,7 @@ heavy ML stack.
 
     python server.py --port 8770 --device auto --offload model
     python server.py --port 8770 --quant Q4_K_M       # GGUF transformer
+    python server.py --port 8770 --resident transformer,vae   # pin, don't offload
     python server.py --list-devices                   # what torch sees, then exit
 
 ``--quant`` loads the transformer from a GGUF quantization instead of the base
@@ -35,6 +36,12 @@ server exits on its own after ``--idle-timeout`` seconds without a request.
 
 Renders are serialised behind one lock: a single diffusion pipeline cannot run
 two prompts at once, and on an offloaded GPU a second one would thrash.
+
+``--offload model`` keeps the weights in system RAM and moves each component onto
+the card as the pipeline reaches it, so VRAM reads near-zero between renders.
+``--resident`` pins named components instead, which matters when the bus is slow
+(an eGPU over Thunderbolt) — but only on a card with headroom: whatever stays
+resident is memory the activations no longer have. See ``_pin_resident``.
 
 Unknown pipeline options (``true_cfg_scale``, ``output_resolution``, …) are filtered
 against the installed pipeline's real signature and reported back in
@@ -122,6 +129,12 @@ class ModelSettings:
     vae_tiling: bool = False
     vae_slicing: bool = False
     attention_slicing: bool = False
+    # Pipeline components pinned to the GPU while the rest stay CPU-offloaded.
+    # The point is that components are not used equally: the transformer runs
+    # once per denoising step, the text encoder once per *render*. On a slow bus
+    # (an eGPU over Thunderbolt) pinning the hot components and letting the cold
+    # ones travel costs a fraction of moving the whole pipeline every time.
+    resident: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +232,15 @@ def torch_device(device: str) -> Any:
         _, _, index = device.partition(":")
         return torch_directml.device(int(index or 0))
     return device
+
+
+def _is_module(component: Any) -> bool:
+    """True for pipeline entries that are actual weights (not tokenizers/schedulers)."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is always present in the venv
+        return False
+    return isinstance(component, torch.nn.Module)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +371,7 @@ class QwenImageBackend:
     _pipe: Any = None
     _edit_pipe: Any = None
     _placed: Any = None  # pipeline the offload hooks are currently installed on
+    resident_applied: tuple[str, ...] = ()  # of ``settings.resident``, what the pipeline had
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def load(self) -> None:
@@ -475,8 +498,10 @@ class QwenImageBackend:
         offload = self.settings.offload
         device = torch_device(self.device)
         if offload == "sequential":
+            self._pin_resident(pipe)
             pipe.enable_sequential_cpu_offload(device=device)
         elif offload == "model":
+            self._pin_resident(pipe)
             pipe.enable_model_cpu_offload(device=device)
         elif offload == "none":
             pipe.to(device)
@@ -484,6 +509,52 @@ class QwenImageBackend:
             raise ValueError(f"offload must be none, model or sequential, got {offload!r}")
 
         self._apply_memory_savers(pipe)
+
+    def _pin_resident(self, pipe: Any) -> None:
+        """Exclude the configured components from CPU offloading.
+
+        Two things are needed, and only doing the first is a silent no-op:
+
+        * ``_exclude_from_cpu_offload`` names components that should be moved to
+          the device once and left there.  But diffusers only consults it for
+          components *outside* ``model_cpu_offload_seq`` — everything in the
+          chain is hooked unconditionally.
+        * So the pinned names must also be removed from ``model_cpu_offload_seq``.
+          They then fall through to the branch that honours the exclusion list.
+
+        Unknown names are dropped with a warning rather than raising — component
+        names differ between pipeline classes, and a stale config entry should
+        not stop the server from starting.
+        """
+        wanted = [c.strip() for c in self.settings.resident if c.strip()]
+        if not wanted:
+            return
+
+        available = {
+            name
+            for name, component in getattr(pipe, "components", {}).items()
+            if _is_module(component)
+        }
+        unknown = [name for name in wanted if name not in available]
+        if unknown:
+            logger.warning(
+                "resident component(s) %s not on this pipeline; known: %s",
+                ", ".join(unknown),
+                ", ".join(sorted(available)) or "(none)",
+            )
+        keep = [name for name in wanted if name in available]
+        self.resident_applied = tuple(keep)
+        if not keep:
+            return
+
+        pipe._exclude_from_cpu_offload = list(keep)
+
+        seq = getattr(pipe, "model_cpu_offload_seq", None)
+        if seq:
+            remaining = [name for name in seq.split("->") if name not in keep]
+            pipe.model_cpu_offload_seq = "->".join(remaining)
+            logger.debug("offload chain %r -> %r", seq, pipe.model_cpu_offload_seq)
+        logger.info("pinned to %s: %s", self.device, ", ".join(keep))
 
     def _apply_memory_savers(self, pipe: Any) -> None:
         """Enable the configured activation-memory reducers.
@@ -542,6 +613,8 @@ class QwenImageBackend:
             "vae_tiling": s.vae_tiling,
             "vae_slicing": s.vae_slicing,
             "attention_slicing": s.attention_slicing,
+            "resident": list(s.resident),
+            "resident_applied": list(self.resident_applied),
             # quant_file alone (no --quant) still means a quantized transformer
             "quant": s.quant if s.quant != "none" else ("custom" if self.quant_path else "none"),
             "quant_file": self.quant_path,
@@ -729,6 +802,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="CPU offload strategy: none needs ~20 GB VRAM, sequential the least (and is slowest)",
     )
     ap.add_argument(
+        "--resident",
+        default=",".join(d.resident),
+        help=(
+            "Comma-separated pipeline components to pin to the GPU instead of offloading "
+            "them, e.g. 'transformer,vae'. Only meaningful with --offload model/sequential"
+        ),
+    )
+    ap.add_argument(
         "--vae-tiling",
         action="store_true",
         default=d.vae_tiling,
@@ -804,6 +885,7 @@ def main(argv: list[str] | None = None) -> int:
             vae_tiling=args.vae_tiling,
             vae_slicing=args.vae_slicing,
             attention_slicing=args.attention_slicing,
+            resident=tuple(c.strip() for c in args.resident.split(",") if c.strip()),
             quant=args.quant,
             quant_repo=args.quant_repo,
             quant_file=args.quant_file,

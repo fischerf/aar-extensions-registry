@@ -174,6 +174,12 @@ class QwenImageConfig:
     vae_tiling: bool = False
     vae_slicing: bool = False
     attention_slicing: bool = False
+    # Components pinned to the GPU while the rest stay CPU-offloaded. The
+    # transformer runs once per denoising *step*, the text encoder once per
+    # *render* — so on a slow bus (eGPU over Thunderbolt) pinning the hot
+    # components and letting the cold ones travel beats moving everything.
+    # Only meaningful with offload "model" or "sequential".
+    resident_components: list[str] = field(default_factory=list)
     quant: str = "none"  # "none" (full bf16) or a key of GGUF_QUANTS
     quant_repo: str = GGUF_REPO
     quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
@@ -385,6 +391,8 @@ class QwenImageClient:
         ]  # fmt: skip
         if cfg.quant_file:
             cmd += ["--quant-file", cfg.quant_file]
+        if cfg.resident_components:
+            cmd += ["--resident", ",".join(cfg.resident_components)]
         if cfg.vae_tiling:
             cmd.append("--vae-tiling")
         if cfg.vae_slicing:
