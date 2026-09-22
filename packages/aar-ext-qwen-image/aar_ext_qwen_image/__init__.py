@@ -168,6 +168,12 @@ class QwenImageConfig:
     device: str = "auto"  # "auto" | "cuda:N" (NVIDIA or AMD/ROCm) | "xpu" | "mps" | "dml:N" | "cpu"
     dtype: str = "bfloat16"
     offload: str = "model"  # "none" | "model" | "sequential"
+    # Activation-memory reducers. They matter with ``offload="none"``, where the
+    # weights hold most of the card and the per-step activations decide whether a
+    # larger image fits or spills into host memory.
+    vae_tiling: bool = False
+    vae_slicing: bool = False
+    attention_slicing: bool = False
     quant: str = "none"  # "none" (full bf16) or a key of GGUF_QUANTS
     quant_repo: str = GGUF_REPO
     quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
@@ -379,6 +385,12 @@ class QwenImageClient:
         ]  # fmt: skip
         if cfg.quant_file:
             cmd += ["--quant-file", cfg.quant_file]
+        if cfg.vae_tiling:
+            cmd.append("--vae-tiling")
+        if cfg.vae_slicing:
+            cmd.append("--vae-slicing")
+        if cfg.attention_slicing:
+            cmd.append("--attention-slicing")
         return cmd
 
     def start(self) -> None:

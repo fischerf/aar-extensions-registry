@@ -707,6 +707,23 @@ def test_normalise_quant(typed: str, expected: str | None) -> None:
     assert normalise_quant(typed) == expected
 
 
+def test_memory_savers_are_off_by_default() -> None:
+    _, client = make(None)
+    cmd = client.server_command()
+    for flag in ("--vae-tiling", "--vae-slicing", "--attention-slicing"):
+        assert flag not in cmd
+
+
+def test_memory_savers_reach_the_server_command() -> None:
+    """They matter with offload="none", where activations decide what fits."""
+    _, client = make(None, offload="none", vae_tiling=True, attention_slicing=True)
+    cmd = client.server_command()
+    assert "--vae-tiling" in cmd
+    assert "--attention-slicing" in cmd
+    assert "--vae-slicing" not in cmd
+    assert cmd[cmd.index("--offload") + 1] == "none"
+
+
 def test_server_command_passes_the_quant_through() -> None:
     _, client = make(None, quant="Q4_K_M")
     cmd = client.server_command()

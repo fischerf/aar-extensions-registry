@@ -115,6 +115,13 @@ class ModelSettings:
     quant: str = "none"  # "none" or one of GGUF_QUANTS
     quant_repo: str = GGUF_REPO
     quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
+    # Memory savers that trade a little speed for a much lower activation peak.
+    # They matter most with ``offload="none"``: the weights then occupy most of
+    # the card, and it is the per-step activations that decide whether a larger
+    # image fits or spills into host memory.
+    vae_tiling: bool = False
+    vae_slicing: bool = False
+    attention_slicing: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +483,36 @@ class QwenImageBackend:
         else:
             raise ValueError(f"offload must be none, model or sequential, got {offload!r}")
 
+        self._apply_memory_savers(pipe)
+
+    def _apply_memory_savers(self, pipe: Any) -> None:
+        """Enable the configured activation-memory reducers.
+
+        Each is best-effort: diffusers' Qwen-Image pipelines have gained and lost
+        these helpers between releases, and a missing one should degrade to "not
+        enabled" rather than refuse to start the server.
+        """
+        s = self.settings
+        wanted = (
+            ("vae_tiling", s.vae_tiling, "enable_vae_tiling"),
+            ("vae_slicing", s.vae_slicing, "enable_vae_slicing"),
+            ("attention_slicing", s.attention_slicing, "enable_attention_slicing"),
+        )
+        for label, enabled, method in wanted:
+            if not enabled:
+                continue
+            fn = getattr(pipe, method, None)
+            if fn is None:
+                logger.warning(
+                    "%s requested but %s() is not available on this pipeline", label, method
+                )
+                continue
+            try:
+                fn()
+                logger.info("%s enabled", label)
+            except Exception:
+                logger.warning("%s could not be enabled", label, exc_info=True)
+
     def _vram(self) -> str:
         if self.device.startswith("cuda"):
             try:
@@ -502,6 +539,9 @@ class QwenImageBackend:
             "transformer": self.transformer_name,
             "dtype": s.dtype,
             "offload": s.offload,
+            "vae_tiling": s.vae_tiling,
+            "vae_slicing": s.vae_slicing,
+            "attention_slicing": s.attention_slicing,
             # quant_file alone (no --quant) still means a quantized transformer
             "quant": s.quant if s.quant != "none" else ("custom" if self.quant_path else "none"),
             "quant_file": self.quant_path,
@@ -689,6 +729,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="CPU offload strategy: none needs ~20 GB VRAM, sequential the least (and is slowest)",
     )
     ap.add_argument(
+        "--vae-tiling",
+        action="store_true",
+        default=d.vae_tiling,
+        help="Decode the VAE in tiles — much lower peak memory at high resolutions",
+    )
+    ap.add_argument(
+        "--vae-slicing",
+        action="store_true",
+        default=d.vae_slicing,
+        help="Decode one latent at a time — lowers peak memory when batching",
+    )
+    ap.add_argument(
+        "--attention-slicing",
+        action="store_true",
+        default=d.attention_slicing,
+        help="Compute attention in slices — lowers the per-step activation peak",
+    )
+    ap.add_argument(
         "--quant",
         choices=["none", *GGUF_QUANTS],
         default=d.quant,
@@ -743,6 +801,9 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             dtype=args.dtype,
             offload=args.offload,
+            vae_tiling=args.vae_tiling,
+            vae_slicing=args.vae_slicing,
+            attention_slicing=args.attention_slicing,
             quant=args.quant,
             quant_repo=args.quant_repo,
             quant_file=args.quant_file,

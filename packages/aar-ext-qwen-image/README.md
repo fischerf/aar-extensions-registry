@@ -586,6 +586,10 @@ each side at 4096.
 
 ## Recipe: a transparent sprite sheet for a platformer
 
+> For the full end-to-end version of this — sub-agent config, two-GPU pinning, slicing the
+> sheet in a canvas game, and the timeouts involved — see
+> [`docs/sprite-sheet-workflow.md`](../../../docs/sprite-sheet-workflow.md) in the aar repo.
+
 Qwen-Image-2.1 has **native RGBA output**. There is no `transparent` argument on the
 pipeline — transparency is requested in the *prompt*, using the model card's wording:
 
@@ -674,7 +678,8 @@ cp packages/aar-ext-qwen-image/qwen-image.example.json ~/.aar/qwen-image.json
 | `out_dir` | `""` | where generated PNGs land: empty = aar's current working directory, a relative path like `images` or `assets/renders` = that subdirectory of the cwd, an absolute or `~` path = exactly that directory (created on first render) |
 | `width` / `height` / `steps` | `1024` / `1024` / `30` | the model card's example uses 2048px and 40 steps |
 | `max_pixels` | `4300800` (2400x1792) | requests above this are refused before reaching the GPU; covers every documented aspect ratio |
-| `idle_timeout` | `900` | server exits after this many idle seconds (0 = never), like Ollama's `keep_alive` |
+| `idle_timeout` | `900` | server exits after this many idle seconds (**0 = never** — set this on a slow bus / eGPU, where rebuilding the pipeline costs ~2 minutes) |
+| `vae_tiling` / `vae_slicing` / `attention_slicing` | `false` | Opt-in activation-memory reducers, applied after placement. They lower the per-step peak rather than the weight footprint, so they matter with `offload: "none"`. Best-effort: a helper this pipeline lacks logs a warning instead of failing to start |
 | `request_timeout` | `900` | a large image on an offloaded GPU takes minutes |
 | `tools` | all | subset of tools to expose to the model |
 
