@@ -40,18 +40,22 @@ never overwritten (`sunset.png` → `sunset-1.png`).
 `aar` in a project and `image_generate` drops the PNG right there. Set it in
 `~/.aar/qwen-image.json` to change that:
 
-```jsonc
-{
-  "out_dir": ""                 // default: aar's cwd
-  "out_dir": "images"           // ./images under aar's cwd
-  "out_dir": "assets/renders"   // nested subdirectory of aar's cwd
-  "out_dir": "~/.aar/qwen-image/out"   // fixed location, regardless of cwd
-}
+| `out_dir` | images land in |
+|---|---|
+| `""` *(default)* | aar's current working directory |
+| `"images"` | `./images` under aar's cwd |
+| `"assets/renders"` | nested subdirectory of aar's cwd |
+| `"~/.aar/qwen-image/out"` | that fixed directory, whatever the cwd is |
+| `"D:/art/out"` | that fixed directory, whatever the cwd is |
+
+```json
+{ "out_dir": "assets/renders" }
 ```
 
 Anything that is not absolute (and does not start with `~`) is taken relative to the
 working directory aar was started in, and is created on the first render. The cwd is
-read at render time, so the same relative setting follows you from project to project.
+read at render time, not at config load, so the same relative setting follows you from
+project to project — start aar in a game repo and the sprites land in that repo.
 
 Reference images for `image_edit` are accepted in the three forms a model actually
 produces:
@@ -442,14 +446,125 @@ Then ask the agent in plain language. Three prompts that exercise the whole surf
   sticker with bold outlines. 25 steps, seed 99, save as dragon.png
 
 # editing an existing picture — @path, a plain path or the bare name all work
-> Take @~/.aar/qwen-image/out/neon.png and use image_edit to change it to a bright
-  snowy morning with the sign switched off. 30 steps, save as neon-winter.png
+> Take @neon.png and use image_edit to change it to a bright snowy morning with the
+  sign switched off. 30 steps, save as neon-winter.png
 ```
 
 The edit keeps the original's composition — same sign, same camera — and changes only
 what you asked for. If you instead get an unrelated fresh image, the model called
 `image_generate`; `~/.aar/qwen-image/server.log` shows `0 refs` on that render
 rather than `1 refs`.
+
+## Driving the sidecar from a normal aar agent
+
+The image tools are *ordinary aar tools*. Your chat provider (`qwen3.8` on Ollama, an
+Anthropic model, anything) keeps doing the talking and the coding; it just gains two
+extra tools that happen to be backed by a 7B diffusion model on your GPU. Nothing
+special is needed to combine them with `write_file` and `bash`.
+
+### A. One agent, both jobs (start here)
+
+Installed as an entrypoint (`pip install aar-ext-qwen-image`), the extension loads into
+**every** aar process, so `image_generate` sits next to the built-in tools in the same
+registry. Start aar in the project you are building and ask for both halves in one go:
+
+```bash
+cd ~/games/dino
+aar tui
+```
+
+```
+> Make a game asset and then use it:
+  1. image_generate, transparent=true, 1024x512, seed 2024, save as player.png —
+     pixel-art side view of a small green dinosaur running, bold dark outlines,
+     flat colours, no background.
+  2. image_generate, transparent=true, 512x256, seed 2025, save as cactus.png —
+     matching pixel-art cactus obstacle, same style.
+  3. Write index.html + game.js: a canvas endless-runner that loads player.png and
+     cactus.png from this directory, space to jump, score counter.
+  4. Open index.html with the default browser and tell me what to check.
+```
+
+With the default `out_dir` (`""`) both PNGs land in `~/games/dino` — the same directory
+the agent is writing `game.js` into — so the `<img src="player.png">` the model writes
+just works. That is the whole point of the cwd default: **the picture and the code end
+up in the same place**, and the model does not have to reason about
+`~/.aar/qwen-image/out` paths it cannot see.
+
+A render takes tens of seconds to minutes. The agent blocks on the tool call, so give
+it room: `max_steps` high enough for both images plus the code, and a `request_timeout`
+in `qwen-image.json` that covers your slowest size.
+
+### B. A dedicated image sub-agent
+
+aar has no built-in "spawn a subagent" tool — what it has is `bash`, and `aar run` is a
+one-shot agent. So a sub-agent is just the main agent shelling out to a second aar
+configured to do nothing but draw:
+
+`~/.aar/image-agent.json` — an aar config with **no built-in tools at all**:
+
+```json
+{
+  "provider": "qwen3.8",
+  "tools": { "enabled_builtins": [] },
+  "max_steps": 6,
+  "system_prompt": "You are an image generator. Call image_generate exactly once with the user's prompt, then reply with only the saved file path. Never explain."
+}
+```
+
+`enabled_builtins: []` strips `read_file` / `bash` / everything else; extension tools
+are registered separately and survive, so the child agent's *entire* tool surface is
+`image_generate` + `image_edit`. It cannot read your files, write anything but a PNG,
+or run a command. (Setting `system_prompt` *replaces* aar's assembled prompt rather
+than appending to it — fine here, since the tool schemas still reach the model through
+the provider's tool API, and a one-job agent wants none of the coding guidance.)
+
+Then, from the main agent:
+
+```
+> Run this in bash, then build the game around the file it prints:
+  aar run --config ~/.aar/image-agent.json "pixel-art green dinosaur running,
+  transparent, 1024x512, seed 2024, save as player.png"
+```
+
+The child prints the tool result (`saved .../player.png (1024x512, seed 2024, …)`) on
+stdout, the parent reads it out of the `bash` result, and carries on coding. Both
+processes share one sidecar server — the second `aar` finds the already-loaded model on
+`http://127.0.0.1:8770` and renders immediately, no reload.
+
+Give the child the directory you want by running it there, since `out_dir` follows the
+cwd:
+
+```bash
+aar run --config ~/.aar/image-agent.json "... save as player.png"   # -> ./player.png
+```
+
+or pin it per sub-agent with a config of its own:
+
+```bash
+AAR_QWEN_IMAGE_CONFIG=~/.aar/qwen-image-assets.json aar run --config ~/.aar/image-agent.json "..."
+```
+
+where that file sets `{"out_dir": "assets"}`.
+
+**When B is worth it:** a long coding session where you don't want image prompts,
+1024x512 renders and retries eating the main context window; or a weaker/cheaper model
+for prompt-writing than the one doing the coding (`aar run --provider ...`). **When A is
+better:** almost everything else — one less process, one less config, and the coding
+model keeps the seeds and file names it just chose in context.
+
+### Letting the agent look at what it made
+
+Tool results are strings, so neither agent sees pixels. On a vision-capable provider,
+attach the file back explicitly:
+
+```
+> @player.png — is the dinosaur facing right, and is the background actually clear?
+  If not, use image_edit to fix it.
+```
+
+Under the cwd default that is a short relative path, which is also why `image_edit`
+accepts a bare file name and resolves it against `out_dir`.
 
 ## Supported sizes
 
