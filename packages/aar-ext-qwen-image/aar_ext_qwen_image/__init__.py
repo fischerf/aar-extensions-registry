@@ -13,7 +13,10 @@ Tools exposed to the model:
   (aar's current working directory unless ``out_dir`` says otherwise)
 - ``image_edit``     — edit / combine up to ten reference images
 
-Slash-command ``/qwenimage [status|devices|quant|start|stop|generate <prompt>]``.
+Slash-command ``/qwenimage [status|devices|quant|start|stop|generate <prompt>|
+edit <image> <prompt>]``.  ``generate`` and ``edit`` accept ``--size``/``--width``/
+``--height``/``--steps``/``--seed``/``--out``/``--negative``/``--transparent`` flags,
+which is the way to pin render parameters that the chat model keeps dropping.
 
 Configuration is read from ``~/.aar/qwen-image.json`` (all keys optional)::
 
@@ -56,6 +59,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import os
 import re
 import subprocess
@@ -66,6 +70,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 SERVER_SCRIPT = Path(__file__).with_name("server.py")
 ALL_TOOLS = ("image_generate", "image_edit")
@@ -202,6 +208,15 @@ class QwenImageConfig:
     # A 2048*2048 cap silently rejected every non-square documented size.
     max_pixels: int = 2400 * 1792
     log_file: str = "~/.aar/qwen-image/server.log"
+    # Base URL of an Ollama instance that shares this GPU.  Empty disables the
+    # whole mechanism.  When set, every loaded model there is unloaded before a
+    # render, because a chat model pinned by ``OLLAMA_KEEP_ALIVE=-1`` does not
+    # yield the card on its own and the renderer then has nowhere to put the
+    # weights.  See ``evict_timeout``.
+    evict_ollama: str = ""
+    # Seconds to wait for the VRAM to actually come back after asking.  Ollama
+    # answers the unload request before its runner process has exited.
+    evict_timeout: float = 60.0
     tools: list[str] = field(default_factory=lambda: list(ALL_TOOLS))
 
     @classmethod
@@ -234,6 +249,16 @@ class QwenImageConfig:
     @property
     def log_path(self) -> Path:
         return Path(self.log_file).expanduser()
+
+    @property
+    def pid_path(self) -> Path:
+        """Where the server records its process id while running.
+
+        Derived from ``log_file`` rather than being its own setting, so a config
+        that redirects the log (e.g. the SDNQ variant) automatically gets its own
+        pidfile and the two servers do not mistake each other for orphans.
+        """
+        return self.log_path.with_name(self.log_path.stem + ".pid")
 
     @property
     def out_path(self) -> Path:
@@ -300,19 +325,80 @@ class QwenImageClient:
         except httpx.HTTPError:
             return None
 
-    def shutdown(self) -> bool:
+    def shutdown(self) -> dict[str, Any] | None:
+        """Ask the server to exit. Returns its reply, or ``None`` if unreachable.
+
+        The reply carries ``busy`` — whether a render is in flight — because a
+        graceful shutdown cannot complete until that render does, and the caller
+        deserves to know it is waiting on a kill rather than a clean exit.
+        """
         try:
             with self._client(5.0) as c:
-                c.post("/shutdown").raise_for_status()
-        except httpx.HTTPError:
-            return False
-        return True
+                r = c.post("/shutdown")
+                r.raise_for_status()
+                body = r.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        return body if isinstance(body, dict) else {}
 
-    def generate_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def evict_ollama(self) -> list[str]:
+        """Unload every model held by the configured Ollama, freeing its VRAM.
+
+        Returns the names it asked to unload (empty when the feature is off,
+        nothing is loaded, or Ollama is unreachable).
+
+        This exists because the two halves of a local setup compete for one
+        card: a chat model with ``OLLAMA_KEEP_ALIVE=-1`` holds its weights
+        indefinitely, and a 16 GiB model plus a diffusion pipeline do not fit in
+        24 GiB.  Ollama reloads the model by itself on the next prompt, so the
+        only cost is that reload.
+
+        Failures are deliberately soft: if Ollama is not running, or is on a
+        different GPU entirely, rendering should still go ahead.
+        """
+        base = self.config.evict_ollama.rstrip("/")
+        if not base:
+            return []
+        try:
+            with httpx.Client(base_url=base, timeout=10.0, transport=self._transport) as c:
+                loaded = [
+                    m["name"] for m in c.get("/api/ps").json().get("models", []) if m.get("name")
+                ]
+                for name in loaded:
+                    # keep_alive 0 is Ollama's "unload now"; an empty prompt
+                    # means it never runs the model, it only drops it.
+                    c.post("/api/generate", json={"model": name, "keep_alive": 0})
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            logger.debug("qwen-image: could not reach Ollama at %s to evict", base, exc_info=True)
+            return []
+        if not loaded:
+            return []
+        # The POST returns before the runner has exited, so wait for the VRAM.
+        deadline = time.monotonic() + self.config.evict_timeout
+        while time.monotonic() < deadline:
+            try:
+                with httpx.Client(base_url=base, timeout=10.0, transport=self._transport) as c:
+                    if not c.get("/api/ps").json().get("models"):
+                        break
+            except (httpx.HTTPError, ValueError):
+                break
+            time.sleep(1.0)
+        return loaded
+
+    def render_sync(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Blocking POST to ``/generate`` or ``/edit`` — the slash-command path.
+
+        Unlike :meth:`render` this never starts the server; the command checks
+        ``/health`` first so it can tell the user to start it themselves.
+        """
+        self.evict_ollama()
         with self._client(self.config.request_timeout) as c:
-            r = c.post("/generate", json=payload)
+            r = c.post(endpoint, json=payload)
             _raise_for_status(r)
             return r.json()
+
+    def generate_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.render_sync("/generate", payload)
 
     # -- async (tools) --------------------------------------------------------
 
@@ -340,6 +426,7 @@ class QwenImageClient:
                         f"qwen-image server is not running at {self.config.url} "
                         "(autostart is off — run /qwenimage start)"
                     )
+                await asyncio.to_thread(self.evict_ollama)
                 self.start()
             deadline = time.monotonic() + self.config.startup_timeout
             while True:
@@ -363,6 +450,8 @@ class QwenImageClient:
     async def render(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         """POST to ``/generate`` or ``/edit``, starting the server if needed."""
         await self.ensure_ready()
+        # Blocking HTTP + a poll loop, so keep it off the event loop.
+        await asyncio.to_thread(self.evict_ollama)
         async with self._async_client(self.config.request_timeout) as c:
             r = await c.post(endpoint, json=payload)
             _raise_for_status(r)
@@ -385,6 +474,7 @@ class QwenImageClient:
             "--offload", cfg.offload,
             "--max-pixels", str(cfg.max_pixels),
             "--max-images", str(MAX_REF_IMAGES),
+            "--pid-file", str(cfg.pid_path),
             "--idle-timeout", str(cfg.idle_timeout),
             "--quant", cfg.quant,
             "--quant-repo", cfg.quant_repo,
@@ -417,6 +507,19 @@ class QwenImageClient:
                 f"qwen-image server interpreter not found: {cfg.python_path} — "
                 "create the venv (see the aar-ext-qwen-image README) or set 'python' "
                 "in ~/.aar/qwen-image.json"
+            )
+        # The port being free does not mean the GPU is.  uvicorn closes its
+        # listening socket as soon as a graceful shutdown starts, but a wedged
+        # render keeps the process — and the weights on the card — alive well
+        # past that.  Starting a second server then quietly halves the VRAM both
+        # have, and neither finishes.
+        if (orphan := read_pid_file(cfg.pid_path)) is not None:
+            raise QwenImageUnavailable(
+                f"a qwen-image server (pid {orphan}) is still running and holding the GPU, "
+                "even though it is not answering on "
+                f"{cfg.url} — it is probably shutting down behind a stuck render. "
+                "Wait for it to exit, or kill that pid, before starting another "
+                f"(pid file: {cfg.pid_path})"
             )
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -550,6 +653,46 @@ def resolve_out_path(out_dir: Path, name: str | None) -> Path:
     return path
 
 
+def pid_alive(pid: int) -> bool:
+    """True if a process with *pid* currently exists.
+
+    Deliberately does not use ``os.kill(pid, 0)``: on Windows that maps onto
+    ``TerminateProcess``, so the "check" would kill the very server we are
+    probing for.  ``OpenProcess`` + a zero-length wait is the safe equivalent.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    return True
+
+
+def read_pid_file(path: Path) -> int | None:
+    """Return the pid recorded in *path*, or ``None`` if it is absent or stale."""
+    try:
+        pid = int(json.loads(path.read_text(encoding="utf-8"))["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return pid if pid_alive(pid) else None
+
+
 def read_input_image(raw: str, out_dir: Path | None = None) -> str:
     """Read an image file from disk and return it base64-encoded.
 
@@ -585,6 +728,85 @@ def read_input_image(raw: str, out_dir: Path | None = None) -> str:
             f"over the {MAX_INPUT_BYTES / 2**20:.0f} MB limit"
         )
     return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# Slash-command flag parsing
+# ---------------------------------------------------------------------------
+
+_BOOL_FLAGS = {"transparent"}
+_INT_FLAGS = {"width", "height", "steps", "seed"}
+_STR_FLAGS = {"out", "negative"}
+_LIST_FLAGS = {"image"}
+_FLAG_ALIASES = {
+    "w": "width",
+    "h": "height",
+    "neg": "negative",
+    "negative-prompt": "negative",
+    "out-name": "out",
+    "ref": "image",
+}
+# ``--size 1600x960`` expands into width/height; ``x`` or ``*`` as the separator.
+_SIZE_RE = re.compile(r"^(\d{1,5})\s*[x*]\s*(\d{1,5})$", re.IGNORECASE)
+_FLAG_RE = re.compile(r"(?:(?<=\s)|^)--([A-Za-z][A-Za-z0-9-]*)")
+# A value may be quoted, which is what ``--negative "a, b"`` needs.  The prose
+# part of the line is never unquoted, so an apostrophe in a prompt is safe.
+_VALUE_RE = re.compile(r"""(?:\s*=\s*|\s+)("[^"]*"|'[^']*'|\S+)""")
+
+_RENDER_USAGE = (
+    "usage: /qwenimage generate [flags] <prompt>\n"
+    "       /qwenimage edit <image> [flags] <prompt>\n"
+    "flags: --size WxH | --width N --height N, --steps N, --seed N,\n"
+    '       --out name.png, --negative "...", --transparent, --image <path> (extra refs)'
+)
+
+
+def parse_render_flags(text: str) -> tuple[dict[str, Any], str]:
+    """Split ``--flag value`` overrides out of a slash-command argument string.
+
+    Flags may appear anywhere in *text*; everything left over is returned as the
+    prose part, which is the prompt (and, for ``edit``, the leading file name).
+    Returns ``(overrides, prose)`` and raises :class:`ValueError` on an unknown
+    flag or a non-integer where an integer is required.
+    """
+    flags: dict[str, Any] = {}
+    kept: list[str] = []
+    pos = 0
+    while match := _FLAG_RE.search(text, pos):
+        name = _FLAG_ALIASES.get(match.group(1).lower(), match.group(1).lower())
+        kept.append(text[pos : match.start()])
+        end = match.end()
+        if name in _BOOL_FLAGS:
+            flags[name] = True
+        elif name in _INT_FLAGS or name in _STR_FLAGS or name in _LIST_FLAGS or name == "size":
+            value_match = _VALUE_RE.match(text, end)
+            if value_match is None:
+                raise ValueError(f"--{name} needs a value")
+            end = value_match.end()
+            raw = value_match.group(1)
+            if raw[:1] in ("'", '"') and raw[-1:] == raw[:1]:
+                raw = raw[1:-1]
+            if name in _INT_FLAGS:
+                try:
+                    flags[name] = int(raw)
+                except ValueError:
+                    raise ValueError(f"--{name} must be a whole number, got {raw!r}") from None
+            elif name == "size":
+                size_match = _SIZE_RE.match(raw)
+                if size_match is None:
+                    raise ValueError(f"--size must look like 1600x960, got {raw!r}")
+                flags["width"] = int(size_match.group(1))
+                flags["height"] = int(size_match.group(2))
+            elif name in _LIST_FLAGS:
+                flags.setdefault(name, []).append(raw)
+            else:
+                flags[name] = raw
+        else:
+            known = sorted({*_BOOL_FLAGS, *_INT_FLAGS, *_STR_FLAGS, *_LIST_FLAGS, "size"})
+            raise ValueError(f"unknown flag --{name}; known flags: {', '.join(known)}")
+        pos = end
+    kept.append(text[pos:])
+    return flags, " ".join("".join(kept).split())
 
 
 def save_result(result: dict[str, Any], path: Path) -> Path:
@@ -767,7 +989,10 @@ def register(
                     },
                     "images": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        # ``format: path`` is what makes aar's safety policy apply
+                        # ``allowed_paths`` / ``denied_paths`` to every reference —
+                        # without it an array argument is not recognised as a path.
+                        "items": {"type": "string", "format": "path"},
                         "minItems": 1,
                         "maxItems": MAX_REF_IMAGES,
                         "description": (
@@ -836,7 +1061,7 @@ def register(
         "qwenimage",
         description=(
             "Qwen-Image server: status | devices | quant [<name>] | start | stop | "
-            "generate <prompt>"
+            "generate <prompt> | edit <image> <prompt>"
         ),
     )
     def qwenimage_command(args: str, ctx: Any) -> str:
@@ -932,19 +1157,64 @@ def register(
             )
 
         if sub == "stop":
-            return "qwen-image: stopping" if qwen.shutdown() else "qwen-image: not running"
+            reply = qwen.shutdown()
+            if reply is None:
+                return "qwen-image: not running"
+            if reply.get("busy"):
+                grace = reply.get("force_after")
+                return (
+                    "qwen-image: a render is still in flight — the server cannot exit until "
+                    "it finishes"
+                    + (f", so it will be killed in {grace:.0f}s" if grace else "")
+                    + ". That render's image is lost either way; nothing else was queued "
+                    "behind it."
+                )
+            return "qwen-image: stopping"
 
-        if sub == "generate":
-            if not rest.strip():
-                return "usage: /qwenimage generate <prompt>"
+        if sub in ("generate", "edit"):
+            if f"image_{sub}" not in enabled:
+                return (
+                    f"qwen-image: image_{sub} is not in the configured "
+                    f"tools ({', '.join(enabled) or 'none'})"
+                )
+            try:
+                flags, prose = parse_render_flags(rest)
+            except ValueError as exc:
+                return f"qwen-image: {exc}\n{_RENDER_USAGE}"
+
+            # ``edit`` takes the picture to change as its first word, so that the
+            # common single-reference case needs no flag at all.
+            images: list[str] = []
+            if sub == "edit":
+                ref, _, prose = prose.partition(" ")
+                if not ref:
+                    return _RENDER_USAGE
+                images = [ref, *flags.get("image", [])]
+                if len(images) > MAX_REF_IMAGES:
+                    return f"qwen-image: at most {MAX_REF_IMAGES} reference images"
+            elif flags.get("image"):
+                return "qwen-image: --image only applies to /qwenimage edit"
+
+            prompt = prose.strip()
+            if not prompt:
+                return _RENDER_USAGE
             state = qwen.health()
             if state is None or state.get("status") != "ready":
                 return "qwen-image: server not ready — /qwenimage start, then /qwenimage status"
             try:
-                path = resolve_out_path(cfg.out_path, None)
-                result = qwen.generate_sync(
-                    _payload(rest.strip(), None, None, None, None, None, False)
+                path = resolve_out_path(cfg.out_path, flags.get("out"))
+                payload = _payload(
+                    prompt,
+                    flags.get("negative"),
+                    flags.get("width"),
+                    flags.get("height"),
+                    flags.get("steps"),
+                    flags.get("seed"),
+                    bool(flags.get("transparent")),
                 )
+                if images:
+                    payload["images"] = [read_input_image(p, cfg.out_path) for p in images]
+                result = qwen.render_sync("/edit" if images else "/generate", payload)
                 save_result(result, path)
             except (
                 QwenImageUnavailable,
@@ -957,6 +1227,6 @@ def register(
             return format_result(path, result)
 
         return (
-            "usage: /qwenimage "
-            "[status | devices | quant [<name>] | start | stop | generate <prompt>]"
+            "usage: /qwenimage [status | devices | quant [<name>] | start | stop |\n"
+            "                   generate <prompt> | edit <image> <prompt>]\n" + _RENDER_USAGE
         )

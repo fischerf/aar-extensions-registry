@@ -81,14 +81,81 @@ the name it just saved. A file that genuinely does not exist is still reported a
 ## Slash-command
 
 ```
-/qwenimage                      status (model, device, VRAM, pid)
-/qwenimage devices              every GPU torch can see, and which one is in use
-/qwenimage quant                list the quantizations, marking the active one
-/qwenimage quant Q4_K_M         switch weights (applies on the next server start)
-/qwenimage start                launch the server in the background
-/qwenimage stop                 stop it and free VRAM
-/qwenimage generate <prompt>    quick manual test
+/qwenimage                        status (model, device, VRAM, pid)
+/qwenimage devices                every GPU torch can see, and which one is in use
+/qwenimage quant                  list the quantizations, marking the active one
+/qwenimage quant Q4_K_M           switch weights (applies on the next server start)
+/qwenimage start                  launch the server in the background
+/qwenimage stop                   stop it and free VRAM
+/qwenimage generate <prompt>      render without going through the model
+/qwenimage edit <image> <prompt>  edit a picture without going through the model
 ```
+
+### Rendering from the command, not through the model
+
+`generate` and `edit` call the sidecar directly. Nothing about the request is inferred
+from prose, so this is the way to render when the chat model keeps dropping your
+parameters — see
+[When the model drops your parameters](#c-when-the-model-drops-your-parameters).
+
+```
+/qwenimage edit old-photo.png --size 1600x960 --steps 30 --seed 42 --out colour.png
+  add natural realistic colour, restore detail, clean up noise and compression artefacts
+```
+
+| Flag | Meaning |
+|---|---|
+| `--size WxH` | both dimensions at once; `--width` / `--height` (`--w` / `--h`) also work |
+| `--steps N` | denoising steps |
+| `--seed N` | fix the seed — the one parameter that has no config key, and the one that makes two renders comparable |
+| `--out name.png` | file name inside `out_dir`; same rules as the tool (bare name, `.png`, never overwrites) |
+| `--negative "..."` | negative prompt; quote it if it contains spaces |
+| `--transparent` | RGBA cutout, same prompt wrapping as `transparent=true` |
+| `--image <path>` | an extra reference for `edit`, repeatable up to ten in total |
+
+Flags may appear anywhere in the line and accept `--flag value` or `--flag=value`. Only
+flag *values* are unquoted, so an apostrophe in the prompt is safe. Anything you leave
+out falls back to the config (`width` / `height` / `steps`), exactly as it does for a
+tool call. Runs of whitespace collapse, so the examples here can be typed on one line or
+wrapped across several with `shift+enter` in the fixed TUI.
+
+For `edit`, the **first word after the subcommand is the picture** — a path, a `~` path
+or a bare name resolved against `out_dir`, the same three forms `image_edit` accepts.
+Everything after it is the prompt.
+
+Both subcommands are blocking and refuse to start the server themselves: if it is not
+loaded you get `server not ready`, so run `/qwenimage start` first. Each is gated on the
+matching entry in `tools`, so a config that exposes only `image_generate` also has no
+`/qwenimage edit`.
+
+### Stopping a server that is mid-render
+
+`/qwenimage stop` asks the server to exit, but a render already in flight cannot be
+interrupted — uvicorn finishes in-flight requests before shutting down, and a diffusion
+step does not check for cancellation. So the server reports what it is up against:
+
+```
+> /qwenimage stop
+qwen-image: a render is still in flight — the server cannot exit until it finishes,
+so it will be killed in 20s. That render's image is lost either way; nothing else was
+queued behind it.
+```
+
+After `SHUTDOWN_GRACE_S` (20s) the process hard-exits rather than lingering. That
+matters more than it sounds: until it exits it keeps the weights on the GPU while no
+longer answering on its port, and a `start` issued in that window used to launch a
+*second* server onto the same card — at which point neither finished. The server now
+writes a pid file next to its log (`server.log` → `server.pid`) and `start` refuses
+while that pid is alive:
+
+```
+qwen-image: a qwen-image server (pid 26052) is still running and holding the GPU, even
+though it is not answering on http://127.0.0.1:8770 — it is probably shutting down
+behind a stuck render. Wait for it to exit, or kill that pid, before starting another
+```
+
+The pid file is derived from `log_file`, so a second config with its own log (the SDNQ
+variant) gets its own pid file and the two servers never mistake each other for orphans.
 
 ## Choosing a GPU
 
@@ -109,6 +176,23 @@ directly:
 ```bash
 python path/to/aar_ext_qwen_image/server.py --list-devices
 ```
+
+> **Check your environment before blaming the config.** `HIP_VISIBLE_DEVICES` and
+> `CUDA_VISIBLE_DEVICES` are inherited by the server, and a persistent one set in your
+> user environment will hide the card from torch no matter what `device` says —
+> `HIP_VISIBLE_DEVICES=-1` in particular means *no HIP devices at all*, and
+> `--list-devices` then prints `Failed to get device count` and lists only `cpu`. The
+> config's `hip_visible_devices` / `cuda_visible_devices` keys override the inherited
+> value for the server process, which is the reliable way to pin a card on a machine
+> where those variables are set for something else:
+>
+> ```json
+> { "device": "cuda:0", "hip_visible_devices": "0" }
+> ```
+>
+> An explicit `device` that torch cannot see is a hard error at startup, not a silent
+> fall back to CPU — but `device: "auto"` *will* pick `cpu` when nothing else is
+> visible, which looks like a working server rendering very slowly.
 
 **VRAM.** The bf16 weights are ~31 GiB on disk — transformer 13.3 GiB, text encoder
 16.3 GiB, VAE 1.3 GiB — so the whole pipeline does *not* fit in 24 GB at once. With
@@ -250,9 +334,132 @@ setup this pairs with — renderer on one card, chat model on the other — is w
 
 **The remaining lever is size, not placement.** With Q4_K_M the transformer is ~4.5 GB —
 the bulk of the 21.4 GB is the *unquantized text encoder*, which runs once per render and
-then idles for 30 steps. Quantizing it to 4-bit (~4 GB) would put the pipeline near 10 GB
-and leave ~14 GB for activations, making `offload: "none"` comfortable at any supported
-size. That needs a quantization backend this server does not wire up yet.
+then idles for 30 steps. GGUF does not help: those checkpoints quantize the transformer
+only. See [SDNQ](#sdnq-a-fully-quantized-pipeline) for a checkpoint that quantizes
+everything.
+
+### SDNQ: a fully quantized pipeline
+
+[SDNQ](https://github.com/Disty0/sdnq) (SD.Next Quantization) checkpoints are ordinary
+diffusers pipelines with **every component quantized**, text encoder included — which is
+the part GGUF leaves at bf16.
+
+| checkpoint | text encoder | transformer | vae | total |
+|---|---|---|---|---|
+| `Qwen/Qwen-Image-2.1` + Q4_K_M GGUF | ~15 GB (bf16) | ~4.5 GB | ~1.3 GB | **~21.4 GB** |
+| [`OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit`](https://huggingface.co/OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit) | 6.28 GB | 3.82 GB | 1.26 GB | **11.37 GB** |
+| [`OzzyGT/Qwen_Image_2_1_sdnq_dynamic_8bit`](https://huggingface.co/OzzyGT/Qwen_Image_2_1_sdnq_dynamic_8bit) | 9.34 GB | 6.70 GB | 1.26 GB | **17.32 GB** |
+
+At 11.37 GB the int4 pipeline leaves ~12 GB of a 24 GB card free for activations, which
+is the headroom `offload: "none"` needs — and once it is resident, nothing crosses the
+bus again. Measured on the same RX 7900 XTX, `offload: "none"`, `vae_tiling: true`,
+10.87 GB resident and flat between renders:
+
+| render | base + Q4_K_M, `offload: "model"` | SDNQ int4, `offload: "none"` |
+|---|---|---|
+| model load | 44 s | 64 s |
+| 1024x512, 30 steps | 153 s | **25.6 s** (x2 runs, identical) |
+| 1024x1024, 30 steps | thrashed — 286 s/step | **48.6 s** |
+| 2048x1024, 20 steps | not attempted | **87.5 s** |
+
+Six times faster at 1024x512, reproducible, and the size cliff is gone — 2 MP renders
+that were impossible before now finish in under two minutes. Note this was measured
+*without* the Triton fast path (see the `cl` warning below), so the memory win dominates
+on its own.
+
+> **But int4 degrades the alpha channel.** Transparent output is the one thing it is
+> measurably worse at:
+>
+> | | base + Q4_K_M | SDNQ int4 |
+> |---|---|---|
+> | 1024x512 sprite sheet, fully transparent px | 25.1% | **5.2%** |
+> | 768x768 sticker, fully transparent px | ~20% | **10.2%** |
+>
+> Instead of a clean cutout the int4 model returns a banded purple background — keyable
+> in principle, but noisy enough that it is not a drop-in replacement. Frame uniformity
+> across a sprite row was *better* than bf16 (21.0 / 21.0 / 21.0 / 20.9% opaque), so this
+> is specifically an alpha problem, not a general quality loss.
+>
+> **So: use int4 for opaque work and large sizes, keep the bf16 + GGUF pipeline for
+> transparent sprites.** The 8-bit SDNQ variant (17.32 GB) is the untested middle ground
+> — it may keep the alpha and most of the speed, though 17.32 GB resident leaves much
+> less room for activations.
+
+Install the backend into the **server's** venv and point `model` at the repo. The
+quantization is baked into the checkpoint, so `quant` stays `"none"` (that setting selects
+a GGUF *transformer*, which is a different mechanism):
+
+```bash
+~/.aar/qwen-image/.venv/Scripts/python.exe -m pip install "sdnq>=0.2.2"
+```
+
+```json
+{
+  "model": "OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit",
+  "quant": "none",
+  "offload": "none",
+  "vae_tiling": true,
+  "idle_timeout": 0
+}
+```
+
+The server imports `sdnq` before `from_pretrained` when it is installed — SDNQ weights
+only deserialize once the backend has registered itself. Without the import the load
+fails; with it, nothing else changes.
+
+> **Check that `torch.compile` works first.** SDNQ's fast path
+> (`use_quantized_matmul`) needs Triton / `torch.compile`. Without it the backend falls
+> back to eager mode and dequantizes weights on every operation, which can be *slower*
+> than the unquantized model despite using less memory. On Windows this shows up at
+> import time as:
+>
+> ```
+> SDNQ: Torch Compile test failed! Falling back to PyTorch Eager mode.
+> Error message: RuntimeError: Compiler: cl is not found.
+> ```
+>
+> `cl` is MSVC — install the Visual Studio Build Tools (C++ workload) and it goes away.
+> Benchmark before and after; do not assume int4 is faster just because it is smaller.
+
+#### Trying it side by side
+
+`AAR_QWEN_IMAGE_CONFIG` points the extension at a different settings file, so an
+alternative checkpoint can be benchmarked without touching the one that works. Put the
+variant in its own file, on its own port and with its own log:
+
+```jsonc
+// ~/.aar/qwen-image-sdnq.json — everything else copied from qwen-image.json
+{
+  "url": "http://127.0.0.1:8771",
+  "model": "OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit",
+  "quant": "none",
+  "offload": "none",
+  "vae_tiling": true,
+  "idle_timeout": 0,
+  "log_file": "~/.aar/qwen-image/server-sdnq.log"
+}
+```
+
+```bash
+# only one server may hold the card at a time
+curl -s -X POST http://127.0.0.1:8770/shutdown
+
+AAR_QWEN_IMAGE_CONFIG=~/.aar/qwen-image-sdnq.json aar tui
+> /qwenimage status        # check allocated VRAM against the table above
+> /qwenimage generate a pixel-art dinosaur, transparent, 1024x512
+```
+
+Running `aar` without the variable goes back to the original config, so there is nothing
+to revert if the alternative disappoints. Compare against the numbers in
+[Keeping the model in VRAM](#keeping-the-model-in-vram), and pull the weights first —
+a partial cache fails at load:
+
+```bash
+~/.aar/qwen-image/.venv/Scripts/python.exe -c   "from huggingface_hub import snapshot_download; print(snapshot_download('OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit'))"
+```
+
+See the [diffusers-recipes scripts](https://github.com/asomoza/diffusers-recipes/blob/main/models/qwen_image_2_1/README.md)
+for the reference usage this is modelled on.
 
 ### AMD on Windows: native ROCm (no WSL)
 
@@ -504,6 +711,12 @@ what you asked for. If you instead get an unrelated fresh image, the model calle
 `image_generate`; `~/.aar/qwen-image/server.log` shows `0 refs` on that render
 rather than `1 refs`.
 
+Those prompts assume a chat model that reliably turns "30 steps, seed 42, save as
+neon.png" into tool arguments. Smaller local models frequently drop them and you get a
+default-sized render under a timestamp name instead —
+[When the model drops your parameters](#c-when-the-model-drops-your-parameters) covers
+what to do about that.
+
 ## Driving the sidecar from a normal aar agent
 
 The image tools are *ordinary aar tools*. Your chat provider (`qwen3.8` on Ollama, an
@@ -546,36 +759,70 @@ in `qwen-image.json` that covers your slowest size.
 
 ### B. A dedicated image sub-agent
 
-Declare an `illustrator` profile and the coding agent can delegate to it with the
-built-in [`spawn_agent`](../../../docs/configuration.md#sub-agents-spawn_agent) tool —
-one nested agent whose entire tool surface is `image_generate` + `image_edit`.
+Declare a profile and the coding agent can delegate to it with the built-in
+[`spawn_agent`](../../../docs/configuration.md#sub-agents-spawn_agent) tool — a nested
+agent whose entire tool surface is one image tool.
+
+**Declare two, not one.** Generating and editing are different jobs and the prompt that
+makes one reliable makes the other impossible: an illustrator told "call
+`image_generate` exactly once" will never edit anything, and it is the *description*
+that the parent model reads when it picks an agent.
 
 ```json
 {
   "subagents": {
     "enabled": true,
+    "max_depth": 1,
     "agents": {
       "illustrator": {
-        "description": "Generates a single image from a description and returns its path",
+        "description": "Generates one image from a description and returns the saved file path",
         "tools": [],
-        "system_prompt": "You are an image generator. Call image_generate exactly once, then reply with only the saved file path. Never explain.",
+        "extension_tools": ["image_generate"],
+        "system_prompt": "You are an image generator. Call image_generate exactly once, passing BOTH width and height explicitly, then reply with only the saved file path. Never explain.",
         "max_steps": 6,
-        "timeout": 900
+        "timeout": 1800
+      },
+      "retoucher": {
+        "description": "Edits an existing picture and returns the path of the NEW file (the original is never modified). Give it the full path of the image to change, exactly what to change, and the output size in pixels - an edit does not keep the original's aspect ratio unless you ask for it. Pass a seed when you want two attempts to be comparable.",
+        "tools": [],
+        "extension_tools": ["image_edit"],
+        "system_prompt": "You edit existing pictures. Call image_edit exactly once: put the file path you were given in 'images', and pass BOTH width and height explicitly - never only one, or the other falls back to a default and silently changes the aspect ratio. Pass 'seed' and 'out' when you were given them. Describe only the change, not the whole picture. Then reply with only the saved file path. Never explain.",
+        "max_steps": 6,
+        "timeout": 1800
       }
     }
   }
 }
 ```
 
-`tools: []` strips `read_file` / `bash` / everything else; extension tools are
-registered separately and survive, so the child cannot read your files, write anything
-but a PNG, or run a command. `timeout: 900` becomes the tool's own `timeout_s`, so a
-slow render is not cut short by `tools.command_timeout`.
+Three keys do the real work:
+
+- **`tools: []`** strips `read_file` / `bash` / everything else, so the child cannot read
+  your files, write anything but a PNG, or run a command.
+- **`extension_tools`** is the one people miss. An installed extension registers into
+  *every* agent in the process, sub-agents included, so without this list the child
+  inherits `image_generate`, `image_edit` and whatever other extensions you have. Naming
+  a single tool is also what makes the split above *structural* rather than a matter of
+  the child obeying its prompt: the retoucher has no `image_generate` to call by mistake.
+- **`timeout`** becomes the `spawn_agent` tool's own `timeout_s`, so a slow render is not
+  cut short by `tools.command_timeout`. Keep it above the sidecar's `request_timeout`.
+
+"Passing BOTH width and height" is not padding: small models routinely pass `width` and
+let `height` fall back to the config default, which silently gives you a 512x1024 image
+when you asked for 512x512, or squares up a photo you were editing.
+
+Leaving `provider` off the profile makes the child reuse the parent's model. A *smaller*
+model per profile saves context, but on a single-GPU box it also makes Ollama swap models
+in and out of the same VRAM the renderer wants — worth measuring before assuming it is
+cheaper.
 
 ```
 > Use spawn_agent with the illustrator for a pixel-art green dinosaur running,
   transparent, 1024x512, seed 2024, saved as player.png — then build the game
   around whatever path it reports.
+
+> Use spawn_agent with the retoucher on B:/photos/old.png — add natural realistic
+  colour and restore detail, 1600x960, seed 42, saved as old-colour.png.
 ```
 
 The child returns only its final message (the saved path), so prompt iterations never
@@ -601,6 +848,90 @@ renders and retries eating the main context window; or a cheaper model for
 prompt-writing than the one doing the coding (`"provider"` on the profile). **When A is
 better:** almost everything else — one less moving part, and the coding model keeps the
 seeds and file names it just chose in context.
+
+### C. When the model drops your parameters
+
+`width`, `height`, `steps`, `seed` and `out` are *optional* tool arguments, and a small
+local chat model will often ignore them — you write "1600x960, 30 steps, seed 42, save as
+`foo.png`" in your message and the render comes back at the config default size under a
+timestamp name. This is not a prompt-wording problem you can reliably fix by rephrasing:
+the parameters have to come from somewhere the model is not involved in.
+
+There are three such places, in increasing order of how much you give up.
+
+**1. The slash-command.** `/qwenimage generate` and
+[`/qwenimage edit`](#rendering-from-the-command-not-through-the-model) take the
+parameters as flags and call the sidecar directly, so nothing is inferred from prose:
+
+```
+/qwenimage edit old-photo.png --size 1600x960 --steps 30 --seed 42 --out colour.png
+  add natural realistic colour, restore detail, clean up noise and compression artefacts
+```
+
+This is exact and repeatable — change the prompt, keep `--seed 42`, and the two renders
+are comparable. What you give up is the agent: the command does one render and returns a
+path, it does not then write the code that uses the picture. Reach for it when you are
+iterating on an image, and for the tools when the image is a step in a larger task.
+
+**2. A config file, so the tool call needs fewer arguments.** The config can carry some
+of them, but not all:
+
+| argument | preconfigurable? |
+|---|---|
+| `width` / `height` / `steps` | yes — `width` / `height` / `steps` |
+| guidance | yes — `true_cfg_scale` |
+| output directory | yes — `out_dir` |
+| `seed` | **no** — random unless the model or `--seed` supplies it |
+| `out` (file name) | **no** — defaults to a timestamp |
+| `negative_prompt` | **no** |
+
+Don't move your global defaults for one task — copy them and point
+`AAR_QWEN_IMAGE_CONFIG` at the copy:
+
+```powershell
+Copy-Item $HOME\.aar\qwen-image.json $HOME\.aar\qwen-image-restore.json
+# edit width/height/steps in the copy, e.g. 1600 / 960 / 30
+$env:AAR_QWEN_IMAGE_CONFIG = "$HOME\.aar\qwen-image-restore.json"
+aar tui
+```
+
+Now the message only has to name the tool and the file, which even a small model gets
+right, and you keep the agent:
+
+```
+> Use image_edit on old-photo.png: add natural realistic colour, restore detail,
+  clean up noise and compression artefacts. Keep the composition unchanged.
+```
+
+**3. A system prompt.** A `subagents` profile (section B) whose `system_prompt` reads
+*"always call `image_edit` with width=1600, height=960, steps=30"* puts the parameters
+somewhere that does not compete with the rest of the user's message. Instructions in the
+system prompt survive a long conversation; the same sentence typed into a chat turn does
+not. Still a model deciding, so still not a guarantee — but a much better bet than prose.
+
+Below all three, the sidecar's HTTP API is always there if you want a script instead:
+
+```python
+import base64, httpx, pathlib
+
+src = pathlib.Path("old-photo.png")
+payload = {
+    "prompt": "add natural realistic colour to the whole photograph and restore it",
+    "negative_prompt": "oversaturated, cartoon, watermark, text",
+    "images": [base64.b64encode(src.read_bytes()).decode()],
+    "width": 1600, "height": 960, "steps": 30, "seed": 42,
+}
+r = httpx.post("http://127.0.0.1:8770/edit", json=payload, timeout=900)
+r.raise_for_status()
+pathlib.Path("old-photo-colour.png").write_bytes(base64.b64decode(r.json()["images"][0]))
+```
+
+`POST /generate` takes the same body without `images`.
+
+> **Match the aspect ratio when editing.** `image_edit` falls back to the config
+> `width` / `height` just like `image_generate` does, so editing an 800x480 photo under
+> the default 1024x1024 silently re-renders it square. Either set the ratio in the config
+> you are using for that job, or pass `--size 1600x960`.
 
 ### Letting the agent look at what it made
 
@@ -725,25 +1056,85 @@ cp packages/aar-ext-qwen-image/qwen-image.example.json ~/.aar/qwen-image.json
 | `server_script` | `null` | path to `server.py` as the launcher sees it |
 | `cuda_visible_devices` / `hip_visible_devices` | `null` | set to hide other cards from the server |
 | `out_dir` | `""` | where generated PNGs land: empty = aar's current working directory, a relative path like `images` or `assets/renders` = that subdirectory of the cwd, an absolute or `~` path = exactly that directory (created on first render) |
-| `width` / `height` / `steps` | `1024` / `1024` / `30` | the model card's example uses 2048px and 40 steps |
+| `width` / `height` / `steps` | `1024` / `1024` / `30` | fallback for both tools when the model omits those arguments — the model card's example uses 2048px and 40 steps. There is no config key for `seed`, `out` or `negative_prompt`; see [When the model drops your parameters](#c-when-the-model-drops-your-parameters) |
 | `max_pixels` | `4300800` (2400x1792) | requests above this are refused before reaching the GPU; covers every documented aspect ratio |
 | `idle_timeout` | `900` | server exits after this many idle seconds (**0 = never** — set this on a slow bus / eGPU, where rebuilding the pipeline costs ~2 minutes) |
 | `resident_components` | `[]` | Pipeline components pinned to the GPU instead of being offloaded, e.g. `["transformer", "vae"]`. Only meaningful with `offload` `model`/`sequential`. Pays off when the card has headroom to spare; on a 24 GB card with this pipeline it is slower than plain eviction |
 | `vae_tiling` / `vae_slicing` / `attention_slicing` | `false` | Opt-in activation-memory reducers, applied after placement. They lower the per-step peak rather than the weight footprint, so they matter with `offload: "none"`. Best-effort: a helper this pipeline lacks logs a warning instead of failing to start |
 | `request_timeout` | `900` | a large image on an offloaded GPU takes minutes |
+| `evict_ollama` | `""` | Base URL of an Ollama instance sharing this GPU. When set, every model loaded there is unloaded before the server starts and before each render — see [Sharing one GPU with Ollama](#sharing-one-gpu-with-ollama). Empty disables it |
+| `evict_timeout` | `60` | Seconds to wait for that VRAM to actually come back; Ollama answers the unload before its runner exits |
 | `tools` | all | subset of tools to expose to the model |
 
 Environment overrides: `AAR_QWEN_IMAGE_CONFIG` (config file path), `AAR_QWEN_IMAGE_URL`.
+`AAR_QWEN_IMAGE_CONFIG` is the clean way to keep one set of render defaults per job —
+sprite sizes for a game repo, photo ratios for a restoration pass — without editing the
+global file.
+
+## Sharing one GPU with Ollama
+
+The renderer and your chat model both want the biggest card, and on a 24 GB card
+they do not both fit: a 16 GiB chat model plus a diffusion pipeline is over the
+line before the first step. Worse, `OLLAMA_KEEP_ALIVE=-1` means the chat model
+never yields — and the slash-commands never call the model, so nothing triggers
+an unload on its own.
+
+`evict_ollama` closes that gap. Point it at the Ollama instance that shares the
+card:
+
+```json
+{
+  "evict_ollama": "http://127.0.0.1:11435",
+  "evict_timeout": 60
+}
+```
+
+Before starting the sidecar and before every render, the extension asks that
+instance for its loaded models (`/api/ps`) and unloads each one
+(`keep_alive: 0`), then waits for them to actually go. Measured on a 7900 XTX,
+releasing a 16.09 GiB `qwen3.8` took **2.6s**; Ollama reloads it by itself on the
+next prompt, so the only cost is that reload.
+
+It is deliberately best-effort: an Ollama that is not running, is on a different
+GPU, or simply does not answer never blocks a render. And the wait is bounded by
+`evict_timeout`, so a model that refuses to go delays a render by at most that
+long rather than hanging it.
+
+Two things to get right alongside it:
+
+- **The sidecar has to hand the card back too.** `offload: "none"` keeps the whole
+  pipeline resident, so with `idle_timeout: 0` the chat model can never reload.
+  Either give `idle_timeout` a finite value (60s survives a batch of renders,
+  since the gap between them is only the agent thinking) or use
+  `offload: "model"`, which idles near zero VRAM.
+- **Pin image sub-agents to the *other* model.** A `spawn_agent` profile that
+  inherits the big chat model keeps it loaded on the card for the whole render,
+  which puts you back where you started. Give those profiles a `provider` whose
+  `base_url` is the small model's instance.
 
 ## Notes
 
 - **Server lifetime.** The server is started detached, so it survives the aar process
   and later `aar run` calls reuse the loaded pipeline. It stops after `idle_timeout`
   or `/qwenimage stop`. Its stdin/stdout are never inherited, which keeps `aar acp`
-  (JSON-RPC over stdio) safe.
+  (JSON-RPC over stdio) safe. A stop that cannot complete gracefully escalates to a
+  hard exit after 20s, and a pid file stops a second server being started on top of one
+  that is still holding the card — see
+  [Stopping a server that is mid-render](#stopping-a-server-that-is-mid-render).
+- **A client timeout does not cancel the render.** If `request_timeout` expires the tool
+  returns, but the GPU keeps working and the finished image is discarded, because the
+  result only exists in the HTTP response. Size `request_timeout` from your slowest
+  render, not your average one.
 - **Safety.** The tools only talk to the configured loopback URL and only write inside
   `out_dir` (`side_effects: network, write`; `image_edit` also reads the reference
   images). The server command comes from your config, never from the model.
+  `image_edit`'s `images` argument is annotated `format: "path"`, so aar's policy engine
+  applies `allowed_paths` / `denied_paths` to **every** reference — a picture outside the
+  allowed paths is denied before the sidecar is called, exactly as it would be for
+  `read_file`. That check is on the *tool*, so it governs the model and any sub-agent;
+  `/qwenimage edit` is you typing a path yourself and is not policy-checked. If a render
+  is refused, either start aar where the picture lives (which `out_dir: ""` wants anyway)
+  or widen `safety.allowed_paths`.
 - **Serialised renders.** One diffusion pipeline cannot run two prompts at once, so
   requests queue behind a lock. Ask for one image at a time.
 - **Moving target.** diffusers' Qwen-Image support is new. Unknown pipeline options

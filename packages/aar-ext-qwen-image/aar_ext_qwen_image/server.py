@@ -55,6 +55,7 @@ import argparse
 import base64
 import binascii
 import inspect
+import json
 import io
 import logging
 import os
@@ -85,6 +86,12 @@ EDIT_PIPELINE_CANDIDATES = (
     "QwenImageImg2ImgPipeline",
 )
 DTYPES = ("bfloat16", "float16", "float32")
+# A graceful uvicorn shutdown waits for in-flight requests.  A render holds the
+# pipeline lock for minutes and can wedge outright, and until the process exits
+# it keeps the weights on the GPU — so `/shutdown` escalates to a hard exit
+# after this many seconds rather than leaving an orphan holding the card.
+SHUTDOWN_GRACE_S = 20.0
+
 MAX_SEED = 2**31 - 1
 
 # Kept in step with GGUF_QUANTS in __init__.py by hand: this file is standalone
@@ -232,6 +239,36 @@ def torch_device(device: str) -> Any:
         _, _, index = device.partition(":")
         return torch_directml.device(int(index or 0))
     return device
+
+
+def _register_quant_backends() -> None:
+    """Import optional quantization backends so diffusers can load their weights.
+
+    Checkpoints quantized with SDNQ (SD.Next Quantization) are ordinary diffusers
+    pipelines whose weights only deserialize once ``sdnq`` has registered itself,
+    so the import has to happen *before* ``from_pretrained``.  It is a no-op for
+    every other checkpoint, and simply absent on installs that do not need it.
+
+    This is what makes an int4 pipeline — text encoder included — loadable:
+    GGUF quantization only covers the transformer, leaving a ~15 GB bf16 text
+    encoder that dominates the memory budget.
+    """
+    try:
+        import sdnq  # noqa: F401
+    except ImportError:
+        logger.debug("sdnq not installed; SDNQ-quantized checkpoints will not load")
+        return
+    logger.info("sdnq %s registered", getattr(sdnq, "__version__", "?"))
+
+
+def _resolve_attr(obj: Any, dotted: str) -> Any:
+    """Look up a dotted attribute path, returning None if any hop is missing."""
+    current = obj
+    for part in dotted.split("."):
+        current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current
 
 
 def _is_module(component: Any) -> bool:
@@ -391,6 +428,7 @@ class QwenImageBackend:
         import torch
 
         s = self.settings
+        _register_quant_backends()
         if s.dtype not in DTYPES:
             raise ValueError(f"dtype must be one of {', '.join(DTYPES)}, got {s.dtype!r}")
         self.devices = available_devices()
@@ -564,25 +602,34 @@ class QwenImageBackend:
         enabled" rather than refuse to start the server.
         """
         s = self.settings
+        # Each saver has two spellings: the pipeline-level helper, and the one on
+        # the VAE itself. Qwen-Image pipelines ship the second but not always the
+        # first, so trying only ``pipe.enable_vae_tiling()`` reports "unavailable"
+        # for something the model card actively recommends.
         wanted = (
-            ("vae_tiling", s.vae_tiling, "enable_vae_tiling"),
-            ("vae_slicing", s.vae_slicing, "enable_vae_slicing"),
-            ("attention_slicing", s.attention_slicing, "enable_attention_slicing"),
+            ("vae_tiling", s.vae_tiling, ("enable_vae_tiling", "vae.enable_tiling")),
+            ("vae_slicing", s.vae_slicing, ("enable_vae_slicing", "vae.enable_slicing")),
+            ("attention_slicing", s.attention_slicing, ("enable_attention_slicing",)),
         )
-        for label, enabled, method in wanted:
+        for label, enabled, candidates in wanted:
             if not enabled:
                 continue
-            fn = getattr(pipe, method, None)
-            if fn is None:
+            for path in candidates:
+                fn = _resolve_attr(pipe, path)
+                if fn is None:
+                    continue
+                try:
+                    fn()
+                    logger.info("%s enabled via %s()", label, path)
+                    break
+                except Exception:
+                    logger.warning("%s: %s() failed", label, path, exc_info=True)
+            else:
                 logger.warning(
-                    "%s requested but %s() is not available on this pipeline", label, method
+                    "%s requested but none of %s are available on this pipeline",
+                    label,
+                    ", ".join(f"{c}()" for c in candidates),
                 )
-                continue
-            try:
-                fn()
-                logger.info("%s enabled", label)
-            except Exception:
-                logger.warning("%s could not be enabled", label, exc_info=True)
 
     def _vram(self) -> str:
         if self.device.startswith("cuda"):
@@ -632,6 +679,15 @@ class QwenImageBackend:
         # no generator of its own, so a CPU generator is the portable choice.
         on_device = self.settings.offload == "none" and self.device.startswith("cuda")
         return torch.Generator(device=self.device if on_device else "cpu").manual_seed(seed)
+
+    @property
+    def busy(self) -> bool:
+        """True while a render holds the pipeline lock.
+
+        Used by ``/shutdown``: a graceful exit has to wait for the in-flight
+        render, which on an offloaded GPU is minutes away at best.
+        """
+        return self._lock.locked()
 
     def render(self, req: dict[str, Any]) -> dict[str, Any]:
         """Run one generate (no ``images``) or edit (with ``images``) request."""
@@ -765,11 +821,14 @@ def create_app(
         return _render(req, editing=True)
 
     @app.post("/shutdown")
-    def shutdown() -> dict[str, str]:
-        logger.info("shutdown requested via /shutdown")
+    def shutdown() -> dict[str, Any]:
+        busy = bool(getattr(backend, "busy", False))
+        logger.info("shutdown requested via /shutdown (busy=%s)", busy)
         if on_shutdown is not None:
             on_shutdown()
-        return {"status": "stopping"}
+        # A render in flight means uvicorn's graceful shutdown cannot complete
+        # until it does, so the caller is told the process will be killed.
+        return {"status": "stopping", "busy": busy, "force_after": SHUTDOWN_GRACE_S}
 
     return app
 
@@ -842,6 +901,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="explicit .gguf path, or a file name inside --quant-repo; overrides --quant",
     )
     ap.add_argument("--max-images", type=int, default=10)
+    ap.add_argument(
+        "--pid-file",
+        default=None,
+        help="Write this process id here while running, so a second start can "
+        "detect an orphaned server that still holds the GPU",
+    )
     ap.add_argument("--max-pixels", type=int, default=2048 * 2048)
     ap.add_argument(
         "--idle-timeout",
@@ -850,6 +915,83 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="exit after this many seconds without a request (0 = never)",
     )
     return ap.parse_args(argv)
+
+
+def should_shut_down_for_idle(backend: Any, activity: Activity, idle_timeout: float) -> bool:
+    """True when the server has genuinely been idle long enough to exit.
+
+    A server that has not finished loading is **not** idle.  Loading the SDNQ
+    checkpoint takes 60-90s on a 7900 XTX, so an ``idle_timeout`` shorter than
+    that used to kill the process mid-load — it never served a single request,
+    and the client saw the connection refused.
+    """
+    if idle_timeout <= 0:
+        return False
+    try:
+        if backend.health().get("status") != "ready":
+            return False
+    except Exception:  # pragma: no cover - a backend that cannot self-report
+        return False
+    return activity.idle_for() > idle_timeout
+
+
+def force_exit_after(
+    grace: float,
+    exited: threading.Event,
+    pid_file: str | None = None,
+    exit_fn: Any = None,
+) -> threading.Thread:
+    """Hard-exit the process if a graceful shutdown has not finished in *grace*.
+
+    uvicorn waits for in-flight requests before returning from ``run()``.  A
+    render holds the pipeline lock for minutes and can wedge indefinitely, and
+    for all that time the process keeps its weights on the GPU while no longer
+    answering on its port — so a second server can be started on top of it.
+    Escalating to ``os._exit`` is what makes ``/shutdown`` mean it.
+
+    Returns the watchdog thread; it ends as soon as *exited* is set.
+    """
+    exit_fn = exit_fn or os._exit
+
+    def wait_then_kill() -> None:
+        if exited.wait(grace):
+            return
+        logger.warning(
+            "still running %.0fs after shutdown — forcing exit (pid %d)", grace, os.getpid()
+        )
+        _remove_pid_file(pid_file)
+        exit_fn(3)
+
+    t = threading.Thread(target=wait_then_kill, name="qwen-image-force-exit", daemon=True)
+    t.start()
+    return t
+
+
+def _write_pid_file(path: str | None, port: int) -> None:
+    """Record this process so a later ``start`` can see an orphan holding the GPU.
+
+    The listening socket is *not* enough: uvicorn closes it as soon as a
+    graceful shutdown begins, while the process — and its share of the card —
+    lives on until the in-flight render returns.
+    """
+    if not path:
+        return
+    try:
+        f = Path(path).expanduser()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8")
+    except OSError:  # pragma: no cover - a pidfile is best-effort
+        logger.warning("could not write pid file %s", path, exc_info=True)
+
+
+def _remove_pid_file(path: str | None) -> None:
+    """Delete the pidfile, tolerating a concurrent delete."""
+    if not path:
+        return
+    try:
+        Path(path).expanduser().unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - best-effort
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -893,10 +1035,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     activity = Activity()
     server: uvicorn.Server | None = None
+    exited = threading.Event()
 
     def stop() -> None:
-        if server is not None:
-            server.should_exit = True
+        if server is None:
+            return
+        server.should_exit = True
+        force_exit_after(SHUTDOWN_GRACE_S, exited, args.pid_file)
 
     app = create_app(
         backend,
@@ -910,14 +1055,28 @@ def main(argv: list[str] | None = None) -> int:
     def watchdog() -> None:
         while not server.should_exit:
             time.sleep(10)
-            if args.idle_timeout > 0 and activity.idle_for() > args.idle_timeout:
+            if should_shut_down_for_idle(backend, activity, args.idle_timeout):
                 logger.info("idle for %.0fs — shutting down", activity.idle_for())
                 stop()
 
-    threading.Thread(target=backend.load, name="qwen-image-load", daemon=True).start()
+    def load_then_mark_ready() -> None:
+        # The idle clock starts at process start, but loading 11-31 GiB is not
+        # idleness: without this the watchdog can shut the server down before it
+        # has served anything, and a short ``idle_timeout`` becomes unusable.
+        try:
+            backend.load()
+        finally:
+            activity.touch()
+
+    threading.Thread(target=load_then_mark_ready, name="qwen-image-load", daemon=True).start()
     threading.Thread(target=watchdog, name="qwen-image-idle", daemon=True).start()
     logger.info("listening on http://%s:%d (pid %d)", args.host, args.port, os.getpid())
-    server.run(sockets=[sock])
+    _write_pid_file(args.pid_file, args.port)
+    try:
+        server.run(sockets=[sock])
+    finally:
+        exited.set()
+        _remove_pid_file(args.pid_file)
     logger.info("server stopped (pid %d)", os.getpid())
     return 0
 

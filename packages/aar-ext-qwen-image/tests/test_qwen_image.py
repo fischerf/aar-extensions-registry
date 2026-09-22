@@ -13,6 +13,10 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+import subprocess
+import threading
+import time
+from aar_ext_qwen_image.server import SHUTDOWN_GRACE_S
 from aar_ext_qwen_image import (
     ASPECT_RATIOS,
     GGUF_QUANTS,
@@ -20,8 +24,12 @@ from aar_ext_qwen_image import (
     describe_quant,
     MAX_REF_IMAGES,
     normalise_quant,
+    pid_alive,
+    read_pid_file,
+    parse_render_flags,
     QwenImageClient,
     QwenImageConfig,
+    QwenImageUnavailable,
     format_result,
     read_input_image,
     register,
@@ -84,6 +92,7 @@ class FakeServer:
         self.quant = "none"
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.shutdowns = 0
+        self.shutdown_body: dict[str, Any] = {"status": "stopping", "busy": False}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -111,7 +120,7 @@ class FakeServer:
             )
         if path == "/shutdown":
             self.shutdowns += 1
-            return httpx.Response(200, json={"status": "stopping"})
+            return httpx.Response(200, json=self.shutdown_body)
         body = json.loads(request.content)
         self.requests.append((path, body))
         if self.status != "ready":
@@ -224,7 +233,12 @@ async def test_launcher_skips_local_interpreter_check(tmp_path: Path) -> None:
 
 
 async def test_missing_local_interpreter_is_reported(tmp_path: Path) -> None:
-    api, _ = make(None, python=str(tmp_path / "nope" / "python.exe"), out_dir=str(tmp_path))
+    api, _ = make(
+        None,
+        python=str(tmp_path / "nope" / "python.exe"),
+        out_dir=str(tmp_path),
+        log_file=str(tmp_path / "server.log"),
+    )
     out = await api.tools["image_generate"](prompt="x")
     assert "interpreter not found" in out
 
@@ -466,11 +480,165 @@ def test_command_generate_usage(tmp_path: Path) -> None:
     assert api.commands["qwenimage"]("generate", MagicMock()).startswith("usage:")
 
 
+# ---------------------------------------------------------------------------
+# Slash-command flag parsing + /qwenimage edit
+# ---------------------------------------------------------------------------
+
+
+def test_parse_render_flags_pulls_values_out_of_the_prose() -> None:
+    flags, prose = parse_render_flags(
+        "old.png --size 1600x960 --steps 30 --seed 42 colourise the photo"
+    )
+    assert flags == {"width": 1600, "height": 960, "steps": 30, "seed": 42}
+    assert prose == "old.png colourise the photo"
+
+
+def test_parse_render_flags_accepts_equals_and_quoted_values() -> None:
+    flags, prose = parse_render_flags(
+        'a dog\'s bone --negative="watermark, text" --out=bone.png --transparent'
+    )
+    assert flags == {"negative": "watermark, text", "out": "bone.png", "transparent": True}
+    # An apostrophe in the prompt must survive — only flag values are unquoted.
+    assert prose == "a dog's bone"
+
+
+def test_parse_render_flags_aliases_and_repeated_image() -> None:
+    flags, prose = parse_render_flags("--w 800 --h 480 --image b.png --ref c.png a.png merge")
+    assert flags == {"width": 800, "height": 480, "image": ["b.png", "c.png"]}
+    assert prose == "a.png merge"
+
+
+def test_parse_render_flags_rejects_bad_input() -> None:
+    with pytest.raises(ValueError, match="unknown flag --nope"):
+        parse_render_flags("--nope 1 a prompt")
+    with pytest.raises(ValueError, match="whole number"):
+        parse_render_flags("--steps many a prompt")
+    with pytest.raises(ValueError, match="needs a value"):
+        parse_render_flags("a prompt --seed")
+    with pytest.raises(ValueError, match="1600x960"):
+        parse_render_flags("--size huge a prompt")
+
+
+def test_parse_render_flags_leaves_a_plain_prompt_alone() -> None:
+    assert parse_render_flags("a cat on a bike") == ({}, "a cat on a bike")
+
+
+def test_command_edit_happy_path(tmp_path: Path) -> None:
+    ref = tmp_path / "old.png"
+    ref.write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    out = api.commands["qwenimage"](
+        f"edit {ref} --size 1600x960 --steps 24 --seed 42 --out colour.png "
+        '--negative "watermark" add natural colour',
+        MagicMock(),
+    )
+    assert out.startswith("saved")
+    assert (tmp_path / "colour.png").is_file()
+    path, body = server.requests[-1]
+    assert path == "/edit"
+    assert body["images"] == [PNG_B64]
+    assert (body["width"], body["height"], body["steps"], body["seed"]) == (1600, 960, 24, 42)
+    assert body["negative_prompt"] == "watermark"
+    assert body["prompt"] == "add natural colour"
+
+
+def test_command_edit_resolves_a_bare_name_against_out_dir(tmp_path: Path) -> None:
+    (tmp_path / "old.png").write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    assert api.commands["qwenimage"]("edit old.png brighter", MagicMock()).startswith("saved")
+    assert server.requests[-1][1]["images"] == [PNG_B64]
+
+
+def test_command_edit_falls_back_to_config_size(tmp_path: Path) -> None:
+    (tmp_path / "old.png").write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path), width=1600, height=960, steps=24)
+    api.commands["qwenimage"]("edit old.png brighter", MagicMock())
+    body = server.requests[-1][1]
+    assert (body["width"], body["height"], body["steps"]) == (1600, 960, 24)
+
+
+def test_command_edit_extra_references(tmp_path: Path) -> None:
+    for name in ("a.png", "b.png"):
+        (tmp_path / name).write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    api.commands["qwenimage"]("edit a.png --image b.png merge these", MagicMock())
+    assert len(server.requests[-1][1]["images"]) == 2
+
+
+def test_command_edit_transparent_wraps_the_prompt(tmp_path: Path) -> None:
+    (tmp_path / "a.png").write_bytes(base64.b64decode(PNG_B64))
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    api.commands["qwenimage"]("edit a.png --transparent cut out the subject", MagicMock())
+    assert server.requests[-1][1]["prompt"] == apply_rgba_prompt("cut out the subject")
+
+
+def test_command_edit_usage_and_errors(tmp_path: Path) -> None:
+    (tmp_path / "a.png").write_bytes(base64.b64decode(PNG_B64))
+    api, _ = make(FakeServer(), out_dir=str(tmp_path))
+    cmd = api.commands["qwenimage"]
+    assert cmd("edit", MagicMock()).startswith("usage:")
+    assert cmd("edit a.png", MagicMock()).startswith("usage:")  # no prompt
+    assert "unknown flag --nope" in cmd("edit a.png --nope 1 brighter", MagicMock())
+    assert "not found" in cmd("edit missing.png brighter", MagicMock())
+    assert "--image only applies" in cmd("generate --image a.png a cat", MagicMock())
+
+
+def test_command_edit_too_many_references(tmp_path: Path) -> None:
+    (tmp_path / "a.png").write_bytes(base64.b64decode(PNG_B64))
+    api, _ = make(FakeServer(), out_dir=str(tmp_path))
+    extra = " ".join("--image a.png" for _ in range(MAX_REF_IMAGES))
+    out = api.commands["qwenimage"](f"edit a.png {extra} merge", MagicMock())
+    assert f"at most {MAX_REF_IMAGES} reference images" in out
+
+
+def test_command_edit_disabled_when_tool_not_configured(tmp_path: Path) -> None:
+    api, _ = make(FakeServer(), out_dir=str(tmp_path), tools=["image_generate"])
+    out = api.commands["qwenimage"]("edit a.png brighter", MagicMock())
+    assert "image_edit is not in the configured tools" in out
+
+
+def test_command_generate_accepts_flags(tmp_path: Path) -> None:
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    out = api.commands["qwenimage"](
+        "generate --size 768x768 --seed 7 --out cat.png a cat on a bike", MagicMock()
+    )
+    assert out.startswith("saved")
+    assert (tmp_path / "cat.png").is_file()
+    path, body = server.requests[-1]
+    assert path == "/generate"
+    assert (body["width"], body["height"], body["seed"]) == (768, 768, 7)
+    assert body["prompt"] == "a cat on a bike"
+
+
+def test_command_edit_requires_a_ready_server(tmp_path: Path) -> None:
+    (tmp_path / "a.png").write_bytes(base64.b64decode(PNG_B64))
+    api, _ = make(FakeServer(status="loading"), out_dir=str(tmp_path))
+    assert "not ready" in api.commands["qwenimage"]("edit a.png brighter", MagicMock())
+
+
 def test_command_stop(tmp_path: Path) -> None:
     server = FakeServer()
     api, _ = make(server, out_dir=str(tmp_path))
     assert api.commands["qwenimage"]("stop", MagicMock()) == "qwen-image: stopping"
     assert server.shutdowns == 1
+
+
+def test_command_stop_reports_a_render_in_flight(tmp_path: Path) -> None:
+    """Reporting a bare "stopping" for a busy server is what let an orphan
+    process keep the GPU for 45 minutes — the user has to be told it is a kill.
+    """
+    server = FakeServer()
+    server.shutdown_body = {"status": "stopping", "busy": True, "force_after": 20.0}
+    api, _ = make(server, out_dir=str(tmp_path))
+    out = api.commands["qwenimage"]("stop", MagicMock())
+    assert "still in flight" in out
+    assert "killed in 20s" in out
 
 
 def test_command_start_when_running(tmp_path: Path) -> None:
@@ -595,8 +763,9 @@ def test_gguf_config_eagerly_dequantizes_custom_norms() -> None:
 
 
 class FakeBackend:
-    def __init__(self, status: str = "ready") -> None:
+    def __init__(self, status: str = "ready", busy: bool = False) -> None:
         self.status = status
+        self.busy = busy
         self.calls: list[dict[str, Any]] = []
 
     def health(self) -> dict[str, Any]:
@@ -664,8 +833,296 @@ def test_server_503_while_loading() -> None:
 def test_server_shutdown_calls_hook() -> None:
     called: list[bool] = []
     client = _server_app(FakeBackend(), on_shutdown=lambda: called.append(True))
-    assert client.post("/shutdown").json() == {"status": "stopping"}
+    assert client.post("/shutdown").json() == {
+        "status": "stopping",
+        "busy": False,
+        "force_after": SHUTDOWN_GRACE_S,
+    }
     assert called == [True]
+
+
+def test_server_shutdown_reports_a_render_in_flight() -> None:
+    """A busy server cannot exit gracefully — uvicorn waits for the render — so
+    the caller is told the process will be killed instead of being handed a bare
+    "stopping" for something that may outlive it.
+    """
+    client = _server_app(FakeBackend(busy=True), on_shutdown=lambda: None)
+    body = client.post("/shutdown").json()
+    assert body["busy"] is True
+    assert body["force_after"] == SHUTDOWN_GRACE_S
+
+
+def test_backend_busy_tracks_the_render_lock() -> None:
+    from aar_ext_qwen_image.server import ModelSettings, QwenImageBackend
+
+    backend = QwenImageBackend(ModelSettings())
+    assert backend.busy is False
+    with backend._lock:
+        assert backend.busy is True
+    assert backend.busy is False
+
+
+def test_idle_shutdown_waits_for_the_model_to_finish_loading() -> None:
+    """SDNQ takes 60-90s to load. With idle_timeout=60 the watchdog used to kill
+    the process mid-load, so it served nothing and the client saw a refused
+    connection — twice, on a real box, before this existed.
+    """
+    from aar_ext_qwen_image.server import Activity, should_shut_down_for_idle
+
+    activity = Activity()
+    activity.last -= 600  # long past any timeout
+
+    loading = FakeBackend(status="loading")
+    assert should_shut_down_for_idle(loading, activity, 60) is False
+
+    ready = FakeBackend(status="ready")
+    assert should_shut_down_for_idle(ready, activity, 60) is True
+
+    # idle_timeout 0 means "never exit", whatever the clock says
+    assert should_shut_down_for_idle(ready, activity, 0) is False
+
+    # freshly touched = not idle
+    activity.touch()
+    assert should_shut_down_for_idle(ready, activity, 60) is False
+
+
+def test_loading_does_not_count_as_idle_time() -> None:
+    """The idle clock starts when the process does, but loading 11-31 GiB of
+    weights is not idleness. Before this, a server with idle_timeout=60 and a
+    20s load shut itself down ~40s later having served nothing.
+    """
+    from aar_ext_qwen_image.server import Activity
+
+    activity = Activity()
+    time.sleep(0.05)
+    during_load = activity.idle_for()
+    activity.touch()  # what the load thread does when it finishes
+    assert activity.idle_for() < during_load
+
+
+def test_force_exit_after_kills_a_stalled_shutdown(tmp_path: Path) -> None:
+    """uvicorn will not return from run() while a render is in flight, so a
+    ``/shutdown`` on a busy server leaves the process — and the weights on the
+    GPU — alive indefinitely. The watchdog is what turns that into an exit.
+    """
+    from aar_ext_qwen_image.server import force_exit_after
+
+    pid_file = tmp_path / "server.pid"
+    pid_file.write_text('{"pid": 1}', encoding="utf-8")
+    codes: list[int] = []
+    never = threading.Event()
+
+    force_exit_after(0.05, never, str(pid_file), exit_fn=codes.append).join(timeout=5)
+    assert codes == [3]
+    assert not pid_file.exists(), "the pidfile must not outlive the process"
+
+
+def test_force_exit_after_stands_down_on_a_clean_exit(tmp_path: Path) -> None:
+    from aar_ext_qwen_image.server import force_exit_after
+
+    codes: list[int] = []
+    exited = threading.Event()
+    t = force_exit_after(30.0, exited, None, exit_fn=codes.append)
+    exited.set()
+    t.join(timeout=5)
+    assert codes == [], "a server that exited on its own must not be killed"
+    assert not t.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Evicting a chat model that shares the GPU
+# ---------------------------------------------------------------------------
+
+
+class FakeOllama:
+    """Answers /api/ps and /api/generate, dropping models on keep_alive 0."""
+
+    def __init__(self, loaded: list[str] | None = None, stubborn: bool = False) -> None:
+        self.loaded = list(loaded or [])
+        self.stubborn = stubborn  # never actually frees, to exercise the timeout
+        self.unloaded: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"name": n} for n in self.loaded]})
+        if request.url.path == "/api/generate":
+            body = json.loads(request.content)
+            if body.get("keep_alive") == 0:
+                self.unloaded.append(body["model"])
+                if not self.stubborn:
+                    self.loaded = [m for m in self.loaded if m != body["model"]]
+            return httpx.Response(200, json={"done": True})
+        return httpx.Response(404)
+
+
+def _evicting_client(ollama: FakeOllama, **cfg: Any) -> QwenImageClient:
+    return QwenImageClient(
+        QwenImageConfig(evict_ollama="http://127.0.0.1:11435", **cfg),
+        transport=httpx.MockTransport(ollama),
+    )
+
+
+def test_evict_unloads_every_loaded_model() -> None:
+    ollama = FakeOllama(["qwen3.8:latest", "gemma4:latest"])
+    freed = _evicting_client(ollama).evict_ollama()
+    assert set(freed) == {"qwen3.8:latest", "gemma4:latest"}
+    assert set(ollama.unloaded) == {"qwen3.8:latest", "gemma4:latest"}
+    assert ollama.loaded == []
+
+
+def test_evict_is_a_noop_when_unconfigured() -> None:
+    ollama = FakeOllama(["qwen3.8:latest"])
+    client = QwenImageClient(QwenImageConfig(), transport=httpx.MockTransport(ollama))
+    assert client.evict_ollama() == []
+    assert ollama.unloaded == []
+
+
+def test_evict_is_a_noop_when_nothing_is_loaded() -> None:
+    ollama = FakeOllama([])
+    assert _evicting_client(ollama).evict_ollama() == []
+    assert ollama.unloaded == []
+
+
+def test_evict_tolerates_ollama_being_down() -> None:
+    """Ollama on another GPU, or simply not running, must not block a render."""
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    client = QwenImageClient(
+        QwenImageConfig(evict_ollama="http://127.0.0.1:11435"),
+        transport=httpx.MockTransport(refuse),
+    )
+    assert client.evict_ollama() == []
+
+
+def test_evict_gives_up_after_evict_timeout() -> None:
+    """The unload POST returns before the runner exits, so the wait is polled —
+    but a model that never goes away must not hang the render forever.
+    """
+    ollama = FakeOllama(["qwen3.8:latest"], stubborn=True)
+    client = _evicting_client(ollama, evict_timeout=0.05)
+    t = time.monotonic()
+    assert client.evict_ollama() == ["qwen3.8:latest"]
+    assert time.monotonic() - t < 10
+    assert ollama.loaded == ["qwen3.8:latest"]
+
+
+def test_render_sync_evicts_first(tmp_path: Path) -> None:
+    """The ordering is the whole point: the card has to be free before the
+    sidecar asks for it, not after.
+    """
+    order: list[str] = []
+    ollama = FakeOllama(["qwen3.8:latest"])
+    server = FakeServer()
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/api/"):
+            order.append("evict")
+            return ollama(request)
+        order.append("render")
+        return server(request)
+
+    client = QwenImageClient(
+        QwenImageConfig(evict_ollama="http://127.0.0.1:11435", out_dir=str(tmp_path)),
+        transport=httpx.MockTransport(route),
+    )
+    client.render_sync("/generate", {"prompt": "x", "width": 64, "height": 64, "steps": 1})
+    assert order.index("evict") < order.index("render")
+    assert ollama.unloaded == ["qwen3.8:latest"]
+
+
+# ---------------------------------------------------------------------------
+# Orphaned server detection (pid file)
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_for_this_process_and_a_dead_one() -> None:
+    assert pid_alive(os.getpid()) is True
+    assert pid_alive(-1) is False
+    # A pid that cannot plausibly exist; if it somehow does, the call must still
+    # answer rather than raise.
+    assert pid_alive(0x7FFFFFFE) in (True, False)
+
+
+def test_read_pid_file_variants(tmp_path: Path) -> None:
+    missing = tmp_path / "nope.pid"
+    assert read_pid_file(missing) is None
+
+    live = tmp_path / "live.pid"
+    live.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    assert read_pid_file(live) == os.getpid()
+
+    stale = tmp_path / "stale.pid"
+    stale.write_text(json.dumps({"pid": 0x7FFFFFFE}), encoding="utf-8")
+    assert read_pid_file(stale) in (None, 0x7FFFFFFE)
+
+    junk = tmp_path / "junk.pid"
+    junk.write_text("not json", encoding="utf-8")
+    assert read_pid_file(junk) is None
+
+
+def test_pid_file_reaches_the_server_command(tmp_path: Path) -> None:
+    client = QwenImageClient(QwenImageConfig(log_file=str(tmp_path / "server.log")))
+    cmd = client.server_command()
+    assert "--pid-file" in cmd
+    assert cmd[cmd.index("--pid-file") + 1].endswith("server.pid")
+
+
+def test_pid_path_follows_the_log_file(tmp_path: Path) -> None:
+    """A second config with its own log (the SDNQ variant) gets its own pidfile,
+    so the two servers never mistake each other for orphans.
+    """
+    cfg = QwenImageConfig(log_file=str(tmp_path / "server-sdnq.log"))
+    assert cfg.pid_path == tmp_path / "server-sdnq.pid"
+
+
+def test_start_checks_the_interpreter_before_the_pid_file(tmp_path: Path) -> None:
+    """A missing venv is a config error you must fix; an orphan is transient.
+    Reporting the orphan first would hide the more actionable message.
+    """
+    cfg = QwenImageConfig(
+        log_file=str(tmp_path / "server.log"), python=str(tmp_path / "nope" / "python.exe")
+    )
+    cfg.pid_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    with pytest.raises(QwenImageUnavailable, match="interpreter not found"):
+        QwenImageClient(cfg).start()
+
+
+def test_start_refuses_when_an_orphan_still_holds_the_gpu(tmp_path: Path, monkeypatch) -> None:
+    """The port going quiet does not mean the card is free: uvicorn drops its
+    socket at the start of a graceful shutdown, but a wedged render keeps the
+    process and its weights alive. Starting a second server there halves the
+    VRAM for both.
+    """
+    cfg = QwenImageConfig(log_file=str(tmp_path / "server.log"))
+    cfg.pid_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    client = QwenImageClient(cfg)
+    spawned: list[Any] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: spawned.append(a))
+
+    with pytest.raises(QwenImageUnavailable, match=f"pid {os.getpid()}"):
+        client.start()
+    assert spawned == []
+
+
+def test_start_ignores_a_stale_pid_file(tmp_path: Path, monkeypatch) -> None:
+    cfg = QwenImageConfig(
+        log_file=str(tmp_path / "server.log"), python=str(tmp_path / "python.exe")
+    )
+    (tmp_path / "python.exe").write_bytes(b"")
+    cfg.pid_path.write_text(json.dumps({"pid": 4242}), encoding="utf-8")
+    monkeypatch.setattr("aar_ext_qwen_image.pid_alive", lambda pid: False)
+    client = QwenImageClient(cfg)
+    spawned: list[Any] = []
+
+    class _Proc:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (spawned.append(a), _Proc())[1])
+    client.start()
+    assert spawned, "a stale pid file must not block a fresh start"
 
 
 # ---------------------------------------------------------------------------
