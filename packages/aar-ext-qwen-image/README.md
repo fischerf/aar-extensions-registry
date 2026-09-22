@@ -497,61 +497,61 @@ in `qwen-image.json` that covers your slowest size.
 
 ### B. A dedicated image sub-agent
 
-aar has no built-in "spawn a subagent" tool — what it has is `bash`, and `aar run` is a
-one-shot agent. So a sub-agent is just the main agent shelling out to a second aar
-configured to do nothing but draw:
-
-`~/.aar/image-agent.json` — an aar config with **no built-in tools at all**:
+Declare an `illustrator` profile and the coding agent can delegate to it with the
+built-in [`spawn_agent`](../../../docs/configuration.md#sub-agents-spawn_agent) tool —
+one nested agent whose entire tool surface is `image_generate` + `image_edit`.
 
 ```json
 {
-  "provider": "qwen3.8",
-  "tools": { "enabled_builtins": [] },
-  "max_steps": 6,
-  "system_prompt": "You are an image generator. Call image_generate exactly once with the user's prompt, then reply with only the saved file path. Never explain."
+  "subagents": {
+    "enabled": true,
+    "agents": {
+      "illustrator": {
+        "description": "Generates a single image from a description and returns its path",
+        "tools": [],
+        "system_prompt": "You are an image generator. Call image_generate exactly once, then reply with only the saved file path. Never explain.",
+        "max_steps": 6,
+        "timeout": 900
+      }
+    }
+  }
 }
 ```
 
-`enabled_builtins: []` strips `read_file` / `bash` / everything else; extension tools
-are registered separately and survive, so the child agent's *entire* tool surface is
-`image_generate` + `image_edit`. It cannot read your files, write anything but a PNG,
-or run a command. (Setting `system_prompt` *replaces* aar's assembled prompt rather
-than appending to it — fine here, since the tool schemas still reach the model through
-the provider's tool API, and a one-job agent wants none of the coding guidance.)
-
-Then, from the main agent:
+`tools: []` strips `read_file` / `bash` / everything else; extension tools are
+registered separately and survive, so the child cannot read your files, write anything
+but a PNG, or run a command. `timeout: 900` becomes the tool's own `timeout_s`, so a
+slow render is not cut short by `tools.command_timeout`.
 
 ```
-> Run this in bash, then build the game around the file it prints:
-  aar run --config ~/.aar/image-agent.json "pixel-art green dinosaur running,
-  transparent, 1024x512, seed 2024, save as player.png"
+> Use spawn_agent with the illustrator for a pixel-art green dinosaur running,
+  transparent, 1024x512, seed 2024, saved as player.png — then build the game
+  around whatever path it reports.
 ```
 
-The child prints the tool result (`saved .../player.png (1024x512, seed 2024, …)`) on
-stdout, the parent reads it out of the `bash` result, and carries on coding. Both
-processes share one sidecar server — the second `aar` finds the already-loaded model on
-`http://127.0.0.1:8770` and renders immediately, no reload.
+The child returns only its final message (the saved path), so prompt iterations never
+enter the coding agent's context. It runs in the same process and the same working
+directory, so `out_dir` still resolves to the project you started aar in.
 
-Give the child the directory you want by running it there, since `out_dir` follows the
-cwd:
+**Out-of-process variant.** Without `subagents`, the same shape works by shelling out:
 
 ```bash
-aar run --config ~/.aar/image-agent.json "... save as player.png"   # -> ./player.png
+aar run --config ~/.aar/image-agent.json "pixel-art dinosaur, transparent, save as player.png"
 ```
 
-or pin it per sub-agent with a config of its own:
-
-```bash
-AAR_QWEN_IMAGE_CONFIG=~/.aar/qwen-image-assets.json aar run --config ~/.aar/image-agent.json "..."
-```
-
-where that file sets `{"out_dir": "assets"}`.
+where that config carries the same `tools.enabled_builtins: []` and a
+`system_prompt_override`. Note `system_prompt` in a config file is the *assembled*
+prompt and is rebuilt on startup — `system_prompt_override` is the key that replaces
+it. Both processes share one sidecar, so the second `aar` finds the already-loaded
+model on `http://127.0.0.1:8770`. Pin a different output directory per agent with
+`AAR_QWEN_IMAGE_CONFIG=~/.aar/qwen-image-assets.json`, where that file sets
+`{"out_dir": "assets"}`.
 
 **When B is worth it:** a long coding session where you don't want image prompts,
-1024x512 renders and retries eating the main context window; or a weaker/cheaper model
-for prompt-writing than the one doing the coding (`aar run --provider ...`). **When A is
-better:** almost everything else — one less process, one less config, and the coding
-model keeps the seeds and file names it just chose in context.
+renders and retries eating the main context window; or a cheaper model for
+prompt-writing than the one doing the coding (`"provider"` on the profile). **When A is
+better:** almost everything else — one less moving part, and the coding model keeps the
+seeds and file names it just chose in context.
 
 ### Letting the agent look at what it made
 

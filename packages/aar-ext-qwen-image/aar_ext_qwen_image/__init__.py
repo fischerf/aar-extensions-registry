@@ -708,6 +708,9 @@ def register(
                 "required": ["prompt"],
             },
             side_effects=["network", "write"],
+            # A render outlives the executor's shared command_timeout, which
+            # would otherwise cancel it well before request_timeout expires.
+            timeout_s=int(cfg.request_timeout) + 30,
         )
         async def image_generate(
             prompt: str,
@@ -759,6 +762,7 @@ def register(
                 "required": ["prompt", "images"],
             },
             side_effects=["read", "network", "write"],
+            timeout_s=int(cfg.request_timeout) + 30,
         )
         async def image_edit(
             prompt: str,

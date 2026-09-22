@@ -234,6 +234,17 @@ async def test_missing_local_interpreter_is_reported(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_render_tools_outlive_the_shared_command_timeout(tmp_path: Path) -> None:
+    """The executor caps every tool at tools.command_timeout (300s by default).
+
+    A 2048px render on an offloaded card takes longer than that, so the tools
+    must carry their own timeout_s or request_timeout can never take effect.
+    """
+    api, _ = make(None, out_dir=str(tmp_path), request_timeout=900.0)
+    for name in ("image_generate", "image_edit"):
+        assert api.tool_meta[name]["timeout_s"] > 900
+
+
 def test_out_path_defaults_to_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     assert QwenImageConfig().out_path == Path.cwd()
