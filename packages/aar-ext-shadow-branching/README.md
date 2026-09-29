@@ -102,7 +102,7 @@ message.
 | `/revert [N] [--force]` | Alias for `/undo`. |
 | `/branch [N]` | Preserve active shadow as `shadow/session-<id>-branch-<K>` and start a fresh branch from N logical checkpoints back (or `HEAD` if N is omitted), skipping `shadow-meta` commits when counting. Reloads session events from the fork point's JSONL so the LLM context matches the new branch. Multiple branches are allowed. Returns `⑂ branch-K preserved as <branch> — now on fresh <branch>`. |
 | `/switch [<target>]` | Switch to any shadow/branch copy for **this** session. Reloads the session's conversation history from the target branch's JSONL so the LLM context matches the files on disk. Rejects branches belonging to other sessions. See **Switch shorthands** below. Returns `⇄ switched to <branch> (base=<base>, N checkpoint(s), M events)`. |
-| `/branches` | List every shadow/branch copy for this session as an indented listing, with the active branch marked `◀ active`. The canonical shadow is shown as the root; preserved copies are listed below it. |
+| `/branches` | Tree of every shadow/branch copy for this session (canonical first, active marked `◀ active`) with its newest checkpoints — turn, tool, SHA, diffstat, age, `⚠` / `◀ tip` markers — the base anchor, and pending changes. Plain text, so it reads the same in every transport. |
 | `/done [message] [--yes]` | Squash-merge the active shadow back into the base branch recorded in the `shadow-init` anchor. If preserved branches still exist it refuses unless `--yes` is passed. On conflicts it stops without committing, prints the paths, and leaves unresolved merge state on the base. Message parsing drops flags and integer-only tokens. Returns `✓ squashed <shadow> → <base> as <sha>`. |
 
 Error and warning returns use `✗` and `⚠` prefixes respectively.
@@ -164,27 +164,38 @@ group — no configuration changes needed.
 
 ---
 
-## TUI panel (`aar tui --fixed`, ctrl+b)
+## TUI panel
 
 Since 0.3.0 the extension registers a **UI panel** (Aar's `UIPanel` contract,
-`agent.extensions.api`). In the fixed TUI press `ctrl+b` to open it in the
-right column; it shows the session's git shadow tree and runs every operation
-without typing slash commands:
+`agent.extensions.api`); 0.4.0 adds per-node details and a detail pane.
+
+### Fixed TUI (`aar tui --fixed`) — sidebar + zoom
+
+The panel lives in a **sidebar left of the chat**, visible from the start, so
+checkpoints can be followed while the agent works. Labels stay short enough for
+the narrow column; the title carries the status (`⎇ Shadow · shadow · 4 cp ⊞`).
 
 ```
-⎇ Shadow
-session a1b2
-├─ main @ 3f9c1e2
-├─ shadow/session-a1b2  ● active
-│  ├─ e71a9d0  turn  7  edit_file ●
-│  ├─ b02c4f1  turn  6  bash
-│  ├─ 9a8d33c  turn  5  write_file ⚠
-│  └─ …
-├─ shadow/session-a1b2-branch-1  (4 cp)
-└─ 2 modified · 1 untracked (pending)
-───────────────────────────────────────
-[u] undo to here  [b] fork here  [d] diff  [r] refresh  [D] squash → base
+⎇ Shadow · shadow · 4 cp  ⊞
+main @ 3f9c1e2
+▼ shadow ● active
+  ├ t4 edit_file ●
+  ├ t3 write_file ⚠
+  ├ t2 edit_file
+  └ t1 write_file
+▶ branch-1 (3 cp)
+✎ 1 untracked (pending)
+[u] undo to here [b] fork here
+[d] diff [r] refresh [z] zoom
 ```
+
+Press `z` in the sidebar (or click its title) to **zoom** into a near-full-screen
+window: every node gets its detail (`e71a9d0 · 2 files +12 −4 · 5m ago`, the full
+branch name, …), a detail pane on the right shows `git show --stat` for a
+checkpoint, the diff vs. base and recent checkpoints for a branch, the base's
+last commit, or `git status --short` for pending changes — and each action is a
+**clickable button** (keys work too). `esc`, `z`, `ctrl+b` or a click on the
+title close it; the sidebar follows the selection you made in the window.
 
 | Key | Node | Action |
 |-----|------|--------|
@@ -195,16 +206,38 @@ session a1b2
 | `x` | branch | `git branch -D` (confirm). Refuses the active shadow and the base branch. |
 | `D` | root / base / branch | `/done --yes` with the message typed in the dialog (confirm) |
 | `r` | any | re-read the tree |
+| `z` | any | zoom the sidebar into the window / close the window |
 
 * Newest checkpoint on top; `●` marks the tip, `⚠` a checkpoint that touched a
-  sensitive-looking path, `(N cp)` a collapsed branch.
-* Action keys only work while the panel has focus (`ctrl+b` toggles focus,
-  `esc` hides). Mutating actions are refused while the agent is running;
-  `diff` / `refresh` stay available.
+  sensitive-looking path, `(N cp)` a collapsed branch, `✎` uncommitted changes.
+* Action keys only work while the panel has focus (`ctrl+b` focuses the
+  sidebar, again returns to the input, `esc` hides it). Mutating actions are
+  refused while the agent is running; `diff` / `refresh` stay available.
 * Every action prints the same result line the slash command would, and the
   transcript is re-rendered after `undo` / `switch` / `branch`.
 * After `/done` the panel shows *Shadow branching inactive*.
-* The header shows a chip `⎇ session-<id> · N cp` while the panel is armed.
+* The header shows a chip `⎇ shadow · N cp` (or `⎇ branch-K · N cp`) while armed.
+* Hide the sidebar by default with
+  `"tui": {"layout": {"extensions": {"shadow_branching": {"visible": false}}}}`.
+
+### Inline TUI (`aar tui`)
+
+`/panel` prints the same tree as a Rich panel with details, and after every turn
+(or slash command) that moved the shadow state a compact version (5 newest
+checkpoints per branch) is printed automatically — the layout setting above turns
+that off. `/branches` gives the plain-text tree:
+
+```
+⎇ session a1b2 · base main @ 3f9c1e2
+├─ ● shadow/session-a1b2  (4 cp)  ◀ active
+│  ├─ t4   edit_file   e2ebcdc  1 file +2 −0  3m ago  ◀ tip
+│  ├─ t3   write_file  31870a4  1 file +1 −0  4m ago  ⚠
+│  ├─ t2   edit_file   7b5554a  1 file +2 −1  6m ago
+│  └─ t1   write_file  f0da1c6  1 file +2 −0  9m ago
+├─ ○ shadow/session-a1b2-branch-1  (3 cp)
+│  └─ …
+└─ ✎ 1 untracked (pending)
+```
 
 The same tree and actions are available to editors over ACP stdio
 (`_aar/panel_list`, `_aar/panel_snapshot`, `_aar/panel_action`,

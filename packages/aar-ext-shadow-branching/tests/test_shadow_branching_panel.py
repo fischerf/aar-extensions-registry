@@ -173,9 +173,11 @@ def test_snapshot_backfills_details_for_reconstructed_checkpoints(repo) -> None:
 
 def test_status_chip(session_api) -> None:
     api, ctx, repo = session_api
-    assert _panel(api).status_text(ctx) == "⎇ session-s1 · 0 cp"
+    assert _panel(api).status_text(ctx) == "⎇ shadow · 0 cp"
     _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
-    assert _panel(api).status_text(ctx) == "⎇ session-s1 · 1 cp"
+    assert _panel(api).status_text(ctx) == "⎇ shadow · 1 cp"
+    _run_cmd(api, "branch", "", ctx)  # still on the canonical shadow afterwards
+    assert _panel(api).status_text(ctx) == "⎇ shadow · 1 cp"
 
 
 def test_changed_is_set_by_checkpoint_and_cleared_by_transport(session_api) -> None:
@@ -381,3 +383,98 @@ def test_actions_run_through_core_helper(session_api, action_id: str) -> None:
         node = root
     result = asyncio.run(run_ui_action(action, UIInvocation(node=node, ctx=ctx, args={})))
     assert result is None or isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# Richer node data (detail, diffstat, age) and the describe hook
+# ---------------------------------------------------------------------------
+
+
+def test_nodes_carry_compact_labels_and_details(session_api) -> None:
+    from aar_ext_shadow_branching import _NODE_HAS_DETAIL
+
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one\ntwo\n")
+
+    root = _snap(api, ctx)
+    active = _active_branch(root)
+    assert active.label == "shadow ● active"  # short enough for the sidebar
+    tip = active.children[0]
+    assert tip.label == "t1 write_file ●"
+    assert tip.data["added"] == 2 and tip.data["removed"] == 0
+    assert tip.data["time"] > 0
+    if _NODE_HAS_DETAIL:
+        assert active.detail == "shadow/session-s1 · 1 cp"
+        assert tip.detail.startswith(f"{tip.data['hash']} · 1 file +2 −0 · ")
+        assert tip.detail.endswith("ago")
+        assert "squashes" in root.children[0].detail
+
+
+def test_describe_checkpoint_branch_base_and_pending(session_api) -> None:
+    api, ctx, repo = session_api
+    panel = _panel(api)
+    if panel.describe is None:  # pragma: no cover — older core
+        pytest.skip("core without UIPanel.describe")
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one")
+    _write_and_checkpoint(api, ctx, repo, ".env", "SECRET=1")
+
+    root = _snap(api, ctx)
+    active = _active_branch(root)
+    tip, older = active.children
+
+    text = panel.describe(tip, ctx)
+    assert "shadow-auto: write_file turn-2" in text
+    assert ".env" in text and "⚠" in text
+    assert "tip of the active shadow branch" in text
+    assert "drops the 1 newer checkpoint" in panel.describe(older, ctx)
+
+    branch_text = panel.describe(active, ctx)
+    assert branch_text.splitlines()[0] == "shadow/session-s1"
+    assert "vs main:" in branch_text and "2 files changed" in branch_text
+    assert "t2 write_file" in branch_text
+
+    assert "base branch main" in panel.describe(root.children[0], ctx)
+
+    (repo / "dirty.txt").write_text("x", encoding="utf-8")
+    pending = _first(_snap(api, ctx), "info")
+    assert pending.label.startswith("✎ ")
+    assert "dirty.txt" in panel.describe(pending, ctx)
+
+
+def test_branches_command_renders_checkpoint_tree(session_api) -> None:
+    api, ctx, repo = session_api
+    _write_and_checkpoint(api, ctx, repo, "a.txt", "one\n")
+    _write_and_checkpoint(api, ctx, repo, "b.txt", "two\nthree\n")
+    _run_cmd(api, "branch", "1", ctx)  # fork from turn 1, preserve both checkpoints
+    (repo / "dirty.txt").write_text("x", encoding="utf-8")
+
+    out = _run_cmd(api, "branches", "", ctx)
+    assert out is not None
+    lines = out.splitlines()
+    assert lines[0].startswith("⎇ session s1 · base main @ ")
+    active = next(ln for ln in lines if "◀ active" in ln)
+    assert "● shadow/session-s1  (1 cp)" in active
+    assert any("○ shadow/session-s1-branch-1  (2 cp)" in ln for ln in lines)
+    # Checkpoints: turn, tool, sha, diffstat, age — newest first per branch.
+    cp_lines = [ln for ln in lines if " t" in ln and "write_file" in ln]
+    assert len(cp_lines) == 3
+    assert "◀ tip" in cp_lines[0]
+    # active t1, then the preserved branch's t2 (+2 lines) and t1
+    assert " t1 " in cp_lines[0] and " t2 " in cp_lines[1] and " t1 " in cp_lines[2]
+    assert "1 file +2 −0" in cp_lines[1] and "ago" in cp_lines[1]
+    assert lines[-1] == "└─ ✎ 1 untracked (pending)"
+    assert "[" not in out, "plain text — no Rich markup look-alikes"
+
+
+def test_age_and_short_branch_helpers() -> None:
+    from aar_ext_shadow_branching import _age, _short_branch
+
+    assert _age(0) == ""
+    assert _age(100, now=130) == "30s ago"
+    assert _age(100, now=100 + 5 * 60) == "5m ago"
+    assert _age(100, now=100 + 3 * 3600) == "3h ago"
+    assert _age(100, now=100 + 2 * 86400) == "2d ago"
+    assert _short_branch("shadow/session-ab", "ab") == "shadow"
+    assert _short_branch("shadow/session-ab-branch-2", "ab") == "branch-2"
+    assert _short_branch("shadow/session-ab-branch-1-branch-2", "ab") == "branch-1-branch-2"
+    assert _short_branch("main", "ab") == "main"

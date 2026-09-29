@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -74,8 +75,14 @@ try:
     from agent.extensions.api import UIAction, UIInvocation, UINode, UIPanel
 
     _HAS_PANEL_API = True
+    # Newer cores add ``UINode.detail`` (secondary text) and ``UIPanel.describe``
+    # (detail pane of the zoomed window); older ones reject the keywords.
+    _NODE_HAS_DETAIL = "detail" in UINode.__dataclass_fields__
+    _PANEL_HAS_DESCRIBE = "describe" in UIPanel.__dataclass_fields__
 except ImportError:  # pragma: no cover — older core
     _HAS_PANEL_API = False
+    _NODE_HAS_DETAIL = False
+    _PANEL_HAS_DESCRIBE = False
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +279,93 @@ def _checkpoint_details(sha: str, cwd: str | Path | None = None) -> tuple[int, b
     flagged = any(any(n in f.lower() for n in _SENSITIVE_NEEDLES) for f in files)
     _details_cache[sha] = (len(files), flagged)
     return _details_cache[sha]
+
+
+# sha -> {files, flagged, added, removed, time, paths}.  Commits never change,
+# so one ``git show --numstat`` per SHA is enough for the life of the process.
+_stats_cache: dict[str, dict[str, Any]] = {}
+
+
+def _checkpoint_stats(sha: str, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Diffstat, commit time and touched paths of checkpoint *sha* (cached)."""
+    cached = _stats_cache.get(sha)
+    if cached is not None:
+        return cached
+    rc, out, _ = _run_git("show", "--numstat", "--format=%ct", sha, cwd=cwd)
+    paths: list[str] = []
+    added = removed = 0
+    ts = 0
+    for line in out.splitlines() if rc == 0 else []:
+        parts = line.split("\t")
+        if len(parts) == 3:
+            a, r, path = parts
+            added += int(a) if a.isdigit() else 0  # "-" for binary files
+            removed += int(r) if r.isdigit() else 0
+            paths.append(path)
+        elif not ts and line.strip().isdigit():
+            ts = int(line.strip())
+    flagged = any(any(n in f.lower() for n in _SENSITIVE_NEEDLES) for f in paths)
+    stats = {
+        "files": len(paths),
+        "flagged": flagged,
+        "added": added,
+        "removed": removed,
+        "time": ts,
+        "paths": paths,
+    }
+    if rc == 0:
+        _stats_cache[sha] = stats
+    return stats
+
+
+def _age(ts: int, now: float | None = None) -> str:
+    """``12s`` / ``5m`` / ``3h`` / ``2d`` ago; ``""`` for an unknown time."""
+    if ts <= 0:
+        return ""
+    delta = max(0, int((now if now is not None else time.time()) - ts))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _stat_text(stats: dict[str, Any]) -> str:
+    """``2 files +12 −4`` — the shape used in panel details and ``/branches``."""
+    n = stats.get("files", 0)
+    return f"{n} file{'s' if n != 1 else ''} +{stats.get('added', 0)} −{stats.get('removed', 0)}"
+
+
+def _short_branch(branch: str, session_id: str) -> str:
+    """``shadow`` for the canonical branch, ``branch-1`` (or
+    ``branch-1-branch-2``) for preserved copies — the full ref name is too
+    wide for the sidebar."""
+    canonical = f"shadow/session-{session_id}"
+    if branch == canonical:
+        return "shadow"
+    if branch.startswith(canonical + "-"):
+        return branch[len(canonical) + 1 :]
+    return branch
+
+
+def _pending_counts(cwd: str | Path | None = None) -> tuple[int, int]:
+    """(modified, untracked) from ``git status --porcelain``."""
+    rc, out, _ = _run_git("status", "--porcelain", cwd=cwd)
+    if rc != 0 or not out:
+        return 0, 0
+    untracked = sum(1 for ln in out.splitlines() if ln.startswith("??"))
+    return len(out.splitlines()) - untracked, untracked
+
+
+def _pending_text(modified: int, untracked: int) -> str:
+    parts = []
+    if modified:
+        parts.append(f"{modified} modified")
+    if untracked:
+        parts.append(f"{untracked} untracked")
+    return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +634,20 @@ def register(api: Any) -> None:
                 pass
             ckpts.append({"turn": turn, "hash": sha, "tool": tool})
         return turn, ckpts
+
+    # branch -> (tip sha, checkpoints).  Sibling branches don't move unless the
+    # user switches to them, so the tip SHA is a safe key.  Used by /branches
+    # and the UI panel.
+    _branch_ckpt_cache: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+
+    def _checkpoints_of(branch: str) -> list[dict[str, Any]]:
+        tip = _short_hash(branch)
+        cached = _branch_ckpt_cache.get(branch)
+        if cached is not None and cached[0] == tip:
+            return cached[1]
+        _, ckpts = _reconstruct_from_branch(branch)
+        _branch_ckpt_cache[branch] = (tip, ckpts)
+        return ckpts
 
     def _auto_commit_pending(ctx: Any, label: str = "session sync") -> bool:
         """Commit any uncommitted changes with an shadow-meta message.
@@ -1272,15 +1380,46 @@ def register(api: Any) -> None:
 
         canonical = f"shadow/session-{state.session_id}"
         fork_prefix = f"{canonical}-branch-"
-        root_marker = " ◀ active" if state.shadow_branch == canonical else ""
-        lines: list[str] = [f"  {canonical}{root_marker}"]
-        ctx.logger.info("  * %s%s", canonical, " (active)" if root_marker else "")
+        ordered = [canonical] if canonical in branches else []
+        ordered += sorted(b for b in branches if b.startswith(fork_prefix))
+        # Show at most this many checkpoints per branch, newest first.
+        max_cps = 5 if len(ordered) > 1 else 10
+        now = time.time()
 
-        children = sorted(b for b in branches if b.startswith(fork_prefix))
-        for b in children:
-            marker = " ◀ active" if b == state.shadow_branch else ""
-            lines.append(f"      {b}{marker}")
-            ctx.logger.info("  * %s%s", b, " (active)" if marker else "")
+        lines: list[str] = [
+            f"⎇ session {state.session_id} · base {state.original_branch} @ {state.base_anchor}"
+        ]
+        modified, untracked = _pending_counts()
+        pending = _pending_text(modified, untracked)
+        for bi, b in enumerate(ordered):
+            last_branch = bi == len(ordered) - 1 and not pending
+            active = b == state.shadow_branch
+            cps = list(state.checkpoints) if active else _checkpoints_of(b)
+            head = "└─" if last_branch else "├─"
+            stem = "   " if last_branch else "│  "
+            marker = "  ◀ active" if active else ""
+            dot = "●" if active else "○"
+            lines.append(f"{head} {dot} {b}  ({len(cps)} cp){marker}")
+            ctx.logger.info("  * %s%s", b, " (active)" if active else "")
+            shown = list(reversed(cps))[:max_cps]
+            hidden = len(cps) - len(shown)
+            tool_w = max((len(str(c.get("tool", ""))) for c in shown), default=0)
+            for ci, cp in enumerate(shown):
+                last_cp = ci == len(shown) - 1 and not hidden
+                twig = "└─" if last_cp else "├─"
+                stats = _checkpoint_stats(cp["hash"])
+                age = _age(stats["time"], now)
+                flags = ("  ⚠" if stats["flagged"] else "") + (
+                    "  ◀ tip" if active and ci == 0 else ""
+                )
+                lines.append(
+                    f"{stem}{twig} t{cp['turn']:<3} {cp['tool']!s:<{tool_w}}  {cp['hash']}  "
+                    f"{_stat_text(stats)}" + (f"  {age}" if age else "") + flags
+                )
+            if hidden:
+                lines.append(f"{stem}└─ … {hidden} older")
+        if pending:
+            lines.append(f"└─ ✎ {pending} (pending)")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1393,30 +1532,29 @@ def register(api: Any) -> None:
     # ------------------------------------------------------------------
 
     if _HAS_PANEL_API:
-        # branch -> (tip sha, checkpoints).  Sibling branches don't move
-        # unless the user switches to them, so the tip SHA is a safe key.
-        _branch_ckpt_cache: dict[str, tuple[str, list[dict[str, Any]]]] = {}
 
-        def _checkpoints_of(branch: str) -> list[dict[str, Any]]:
-            tip = _short_hash(branch)
-            cached = _branch_ckpt_cache.get(branch)
-            if cached is not None and cached[0] == tip:
-                return cached[1]
-            _, ckpts = _reconstruct_from_branch(branch)
-            _branch_ckpt_cache[branch] = (tip, ckpts)
-            return ckpts
+        def _node(*args: Any, detail: str = "", **kwargs: Any) -> UINode:
+            """``UINode`` with ``detail`` when the core supports it."""
+            if _NODE_HAS_DETAIL and detail:
+                kwargs["detail"] = detail
+            return UINode(*args, **kwargs)
 
-        def _cp_node(cp: dict[str, Any], idx: int, total: int, on_active: bool) -> UINode:
+        def _cp_node(
+            cp: dict[str, Any], idx: int, total: int, on_active: bool, now: float
+        ) -> UINode:
+            stats = _checkpoint_stats(cp["hash"])
             files = cp.get("files")
             flagged = cp.get("flagged")
             if files is None or flagged is None:
-                files, flagged = _checkpoint_details(cp["hash"])
+                files, flagged = stats["files"], stats["flagged"]
             is_tip = idx == total - 1
             suffix = (" ⚠" if flagged else "") + (" ●" if on_active and is_tip else "")
             style = "warn" if flagged else ("active" if on_active and is_tip else "")
-            return UINode(
+            age = _age(stats["time"], now)
+            return _node(
                 id=f"cp:{cp['hash']}",
-                label=f"{cp['hash']}  turn {cp['turn']:>2}  {cp['tool']}{suffix}",
+                label=f"t{cp['turn']} {cp['tool']}{suffix}",
+                detail=f"{cp['hash']} · {_stat_text(stats)}" + (f" · {age}" if age else ""),
                 kind="checkpoint",
                 style=style,
                 data={
@@ -1425,6 +1563,9 @@ def register(api: Any) -> None:
                     "tool": cp["tool"],
                     "files": files,
                     "flagged": flagged,
+                    "added": stats["added"],
+                    "removed": stats["removed"],
+                    "time": stats["time"],
                     # "to here" == drop everything after this checkpoint.
                     # /undo N and /branch N count back from the tip, so the
                     # tip itself is 0 — the undo action refuses that.
@@ -1434,21 +1575,8 @@ def register(api: Any) -> None:
             )
 
         def _pending_summary() -> str:
-            rc, out, _ = _run_git("status", "--porcelain")
-            if rc != 0 or not out:
-                return ""
-            modified = untracked = 0
-            for line in out.splitlines():
-                if line.startswith("??"):
-                    untracked += 1
-                else:
-                    modified += 1
-            parts = []
-            if modified:
-                parts.append(f"{modified} modified")
-            if untracked:
-                parts.append(f"{untracked} untracked")
-            return " · ".join(parts) + " (pending)"
+            text = _pending_text(*_pending_counts())
+            return f"{text} (pending)" if text else ""
 
         def _snapshot(ctx: Any) -> UINode:
             st = state
@@ -1491,15 +1619,18 @@ def register(api: Any) -> None:
                     data={"session_id": st.session_id, "mode": st.mode},
                 )
 
+            now = time.time()
             ckpts = st.checkpoints
-            active = UINode(
+            active_short = _short_branch(st.shadow_branch, st.session_id)
+            active = _node(
                 id=f"br:{st.shadow_branch}",
-                label=f"{st.shadow_branch}  ● active",
+                label=f"{active_short} ● active",
+                detail=f"{st.shadow_branch} · {len(ckpts)} cp",
                 kind="branch",
                 style="active",
                 data={"name": st.shadow_branch, "active": True, "checkpoints": len(ckpts)},
                 # newest first
-                children=[_cp_node(c, i, len(ckpts), True) for i, c in enumerate(ckpts)][::-1],
+                children=[_cp_node(c, i, len(ckpts), True, now) for i, c in enumerate(ckpts)][::-1],
             )
             siblings: list[UINode] = []
             for b in _list_branches(f"shadow/session-{st.session_id}*"):
@@ -1507,18 +1638,22 @@ def register(api: Any) -> None:
                     continue
                 cps = _checkpoints_of(b)
                 siblings.append(
-                    UINode(
+                    _node(
                         id=f"br:{b}",
-                        label=f"{b}  ({len(cps)} cp)",
+                        label=f"{_short_branch(b, st.session_id)} ({len(cps)} cp)",
+                        detail=b,
                         kind="branch",
                         expanded=False,
                         data={"name": b, "active": False, "checkpoints": len(cps)},
-                        children=[_cp_node(c, i, len(cps), False) for i, c in enumerate(cps)][::-1],
+                        children=[_cp_node(c, i, len(cps), False, now) for i, c in enumerate(cps)][
+                            ::-1
+                        ],
                     )
                 )
-            base = UINode(
+            base = _node(
                 id="base",
                 label=f"{st.original_branch} @ {st.base_anchor}",
+                detail="base · /done squashes here",
                 kind="base",
                 data={"name": st.original_branch, "anchor": st.base_anchor},
             )
@@ -1533,13 +1668,63 @@ def register(api: Any) -> None:
                     *siblings,
                     UINode(
                         "pending",
-                        pending or "working tree clean",
+                        f"✎ {pending}" if pending else "✓ working tree clean",
                         "info",
                         style="warn" if pending else "dim",
                     ),
                 ],
                 data={"session_id": st.session_id, "mode": st.mode},
             )
+
+        def _describe(node: UINode, ctx: Any) -> str | None:
+            """Detail-pane text for the zoomed panel window (read-only git)."""
+            st = state
+            if st is None:
+                return None
+            if node.kind == "checkpoint":
+                sha = str(node.data.get("hash", ""))
+                rc, out, err = _run_git("show", "--stat", "--format=%h %s%n%an · %ar", sha)
+                if rc != 0:
+                    return f"✗ git show failed: {err or '(no output)'}"
+                n_back = int(node.data.get("n_back", 0))
+                lines = [out, ""]
+                if node.data.get("flagged"):
+                    lines.append("⚠ touches a sensitive-looking path")
+                if not node.data.get("active_branch", True):
+                    lines.append("on a preserved branch — switch to it to undo or fork here")
+                elif n_back:
+                    lines.append(f"undo to here drops the {n_back} newer checkpoint(s)")
+                else:
+                    lines.append("tip of the active shadow branch")
+                return "\n".join(lines)
+            if node.kind == "branch":
+                name = str(node.data.get("name", ""))
+                lines = [name]
+                lines.append("active shadow branch" if node.data.get("active") else "preserved")
+                rc, out, _ = _run_git("diff", "--shortstat", f"{st.original_branch}...{name}")
+                if rc == 0 and out:
+                    lines.append(f"vs {st.original_branch}: {out.strip()}")
+                rc, out, _ = _run_git("log", "-1", "--format=last commit %ar", name)
+                if rc == 0 and out:
+                    lines.append(out)
+                lines.append("")
+                for child in node.children[:15]:
+                    lines.append(f"{child.label}  {child.detail}".rstrip())
+                if len(node.children) > 15:
+                    lines.append(f"… {len(node.children) - 15} older")
+                return "\n".join(lines)
+            if node.kind == "base":
+                rc, out, _ = _run_git("log", "-1", "--format=%h %s%n%an · %ar", st.original_branch)
+                head = out if rc == 0 else st.original_branch
+                return (
+                    f"base branch {st.original_branch}\n{head}\n\n"
+                    f"anchor {st.base_anchor} (shadow-init)\n"
+                    "/done squash-merges the active shadow branch here"
+                )
+            if node.id == "pending":
+                rc, out, _ = _run_git("status", "--short")
+                return out if rc == 0 and out else "working tree clean"
+            return None
 
         # -- actions: reuse the slash-command implementations -------------
 
@@ -1600,19 +1785,23 @@ def register(api: Any) -> None:
 
         def _act_refresh(inv: UIInvocation) -> str | None:
             _branch_ckpt_cache.clear()
+            _stats_cache.clear()
             return None
 
         def _status(ctx: Any) -> str:
             st = state
             if st is None or not st.enabled:
                 return ""
-            return f"⎇ {st.shadow_branch.split('/')[-1]} · {len(st.checkpoints)} cp"
+            # Short: it heads the narrow sidebar and sits in the header chip.
+            return f"⎇ {_short_branch(st.shadow_branch, st.session_id)} · {len(st.checkpoints)} cp"
 
+        panel_kwargs: dict[str, Any] = {"describe": _describe} if _PANEL_HAS_DESCRIBE else {}
         panel = UIPanel(
             name="shadow_branching",
             title="⎇ Shadow",
             snapshot=_snapshot,
             status=_status,
+            **panel_kwargs,
             actions=[
                 UIAction(
                     "undo",
