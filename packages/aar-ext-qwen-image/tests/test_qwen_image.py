@@ -707,6 +707,43 @@ def test_resolve_gguf_path_reports_a_missing_local_file(tmp_path: Path) -> None:
         resolve_gguf_path(ModelSettings(quant_file=str(missing)))
 
 
+def _fake_hub(monkeypatch, tmp_path: Path) -> Path:
+    """Point the HF cache at *tmp_path* and make every download fail with a 404."""
+    hub = pytest.importorskip("huggingface_hub")
+    import huggingface_hub.constants
+
+    def gone(*_a: Any, **_kw: Any) -> str:
+        raise OSError("404 Client Error: Entry Not Found")
+
+    monkeypatch.setattr(hub, "hf_hub_download", gone)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    return tmp_path
+
+
+def test_resolve_gguf_path_falls_back_to_a_cached_copy(monkeypatch, tmp_path: Path) -> None:
+    """Upstream deleted the file and moved refs/main on — the copy we have still loads."""
+    from aar_ext_qwen_image.server import ModelSettings, gguf_filename, resolve_gguf_path
+
+    settings = ModelSettings(quant="Q4_K_M")
+    cache = _fake_hub(monkeypatch, tmp_path)
+    repo = cache / f"models--{settings.quant_repo.replace('/', '--')}"
+    snap = repo / "snapshots" / "c4de66ef"
+    snap.mkdir(parents=True)
+    (snap / gguf_filename("Q4_K_M")).write_bytes(b"GGUF")
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text("40319fb1")  # a snapshot never fetched
+
+    assert resolve_gguf_path(settings) == str(snap / gguf_filename("Q4_K_M"))
+
+
+def test_resolve_gguf_path_explains_a_file_that_is_gone(monkeypatch, tmp_path: Path) -> None:
+    from aar_ext_qwen_image.server import ModelSettings, resolve_gguf_path
+
+    _fake_hub(monkeypatch, tmp_path)
+    with pytest.raises(RuntimeError, match="point quant_file at it"):
+        resolve_gguf_path(ModelSettings(quant="Q4_K_M"))
+
+
 def test_ensure_single_file_loadable_registers_only_unknown_classes(monkeypatch) -> None:
     """Fakes diffusers: this pins our shim, not the library's table."""
     from aar_ext_qwen_image.server import ensure_single_file_loadable
@@ -1386,6 +1423,27 @@ async def test_transparent_false_leaves_the_prompt_alone(tmp_path: Path) -> None
     _, body = server.requests[0]
     assert body["prompt"] == "a red bicycle"
     assert "transparent" not in body["options"]
+
+
+async def test_payload_tells_the_server_whether_to_keep_alpha(tmp_path: Path) -> None:
+    server = FakeServer()
+    api, _ = make(server, out_dir=str(tmp_path))
+    await api.tools["image_generate"](prompt="a red bicycle")
+    await api.tools["image_generate"](prompt="a dragon sticker", transparent=True)
+
+    assert server.requests[0][1]["transparent"] is False
+    assert server.requests[1][1]["transparent"] is True
+
+
+def test_opaque_render_drops_the_alpha_channel() -> None:
+    """The model returns RGBA even for photos, with alpha well below 255 in places."""
+    pil = pytest.importorskip("PIL.Image")
+    from aar_ext_qwen_image.server import drop_unrequested_alpha
+
+    rgba = pil.new("RGBA", (4, 4), (10, 20, 30, 214))
+    assert drop_unrequested_alpha(rgba, False).mode == "RGB"
+    assert drop_unrequested_alpha(rgba, True).mode == "RGBA"
+    assert drop_unrequested_alpha(rgba, None).mode == "RGBA"  # older client: unchanged
 
 
 async def test_transparent_is_not_applied_twice(tmp_path: Path) -> None:
