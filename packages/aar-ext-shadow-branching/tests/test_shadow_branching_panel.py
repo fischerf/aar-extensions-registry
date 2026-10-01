@@ -520,11 +520,13 @@ def test_commands_declare_argument_hints(repo) -> None:
     api = ExtensionAPI("shadow_branching")
     register(api)
     assert api._command_hints == {
-        "undo": "[N | tN | pN] [--force]",
-        "revert": "[N | tN | pN] [--force]",
+        "undo": "[N | tN | pN] [--force] [--dry-run]",
+        "revert": "[N | tN | pN] [--force] [--dry-run]",
+        "redo": "[--force]",
+        "restore": "<path> [tN | pN | sha] [--force]",
         "branch": "[N | tN | pN]",
         "diff": "[tN | pN] [--patch]",
         "switch": "[main | K | branch-K]",
-        "done": "[message] [--yes]",
+        "done": "[message] [--yes] [--dry-run]",
     }
     assert "branches" in api._commands

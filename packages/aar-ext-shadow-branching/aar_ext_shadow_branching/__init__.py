@@ -80,10 +80,12 @@ try:
     # (detail pane of the zoomed window); older ones reject the keywords.
     _NODE_HAS_DETAIL = "detail" in UINode.__dataclass_fields__
     _PANEL_HAS_DESCRIBE = "describe" in UIPanel.__dataclass_fields__
+    _ACTION_HAS_PREVIEW = "preview" in UIAction.__dataclass_fields__
 except ImportError:  # pragma: no cover — older core
     _HAS_PANEL_API = False
     _NODE_HAS_DETAIL = False
     _PANEL_HAS_DESCRIBE = False
+    _ACTION_HAS_PREVIEW = False
 
 
 # Display-only notes on tool results (checkpoint line under the result / on the
@@ -376,6 +378,24 @@ def _stat_text(stats: dict[str, Any]) -> str:
     return f"{n} file{'s' if n != 1 else ''} +{stats.get('added', 0)} −{stats.get('removed', 0)}"
 
 
+def _shortstat(*revs: str, cwd: str | Path | None = None) -> str:
+    """``3 files +40 −12`` for ``git diff --shortstat <revs>`` (session files
+    under ``.agent/`` excluded); ``no file changes`` when the diff is empty."""
+    rc, out, _ = _run_git("diff", "--shortstat", *revs, "--", ".", ":(exclude).agent", cwd=cwd)
+    if rc != 0 or not out:
+        return "no file changes"
+    nums = {"file": 0, "insertion": 0, "deletion": 0}
+    for part in out.split(","):
+        words = part.split()
+        if len(words) >= 2 and words[0].isdigit():
+            for key in nums:
+                if words[1].startswith(key):
+                    nums[key] = int(words[0])
+    return _stat_text(
+        {"files": nums["file"], "added": nums["insertion"], "removed": nums["deletion"]}
+    )
+
+
 def _short_branch(branch: str, session_id: str) -> str:
     """``shadow`` for the canonical branch, ``branch-1`` (or
     ``branch-1-branch-2``) for preserved copies — the full ref name is too
@@ -426,6 +446,9 @@ class ShadowState:
     # a number is never reused for a different prompt (not even after /undo).
     prompt_counter: int = 0
     last_prompt_id: str = ""  # UserMessage.id the current prompt number belongs to
+    # One entry per /undo that /redo can still re-apply (newest last); cleared
+    # by anything that moves the timeline forward or sideways.
+    redo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     def to_metadata(self) -> dict[str, Any]:
         return asdict(self)
@@ -704,12 +727,16 @@ def register(api: Any) -> None:
         [(index, checkpoint), …])``.  ``prompt_no`` 0 collects checkpoints that
         predate prompt tracking.  Empty list when *no* checkpoint has a prompt —
         callers then keep the flat layout."""
-        if not any(c.get("prompt") for c in ckpts):
+        if not any(c.get("prompt") or c.get("prompt_text") for c in ckpts):
             return []
         groups: list[tuple[int, str, list[tuple[int, dict[str, Any]]]]] = []
         for i, cp in enumerate(ckpts):
             no = int(cp.get("prompt") or 0)
-            if groups and groups[-1][0] == no:
+            if (
+                groups
+                and groups[-1][0] == no
+                and (no or groups[-1][1] == cp.get("prompt_text", ""))
+            ):
                 groups[-1][2].append((i, cp))
             else:
                 groups.append((no, str(cp.get("prompt_text", "")), [(i, cp)]))
@@ -725,8 +752,19 @@ def register(api: Any) -> None:
 
     def _prompt_title(no: int, text: str, limit: int = 40) -> str:
         if not no:
-            return "earlier checkpoints"
+            # Checkpoints outside any prompt: user actions such as /restore
+            # carry their own text; older sessions have none.
+            return _prompt_excerpt(text, limit) if text else "earlier checkpoints"
         return f'p{no} "{_prompt_excerpt(text, limit)}"' if text else f"p{no}"
+
+    def _real_prompt_count(ctx: Any) -> int:
+        """Number of real (non-internal) user messages in the session."""
+        count = 0
+        for ev in getattr(getattr(ctx, "session", None), "events", None) or []:
+            etype = getattr(getattr(ev, "type", None), "value", getattr(ev, "type", None))
+            if etype == "user_message" and not (getattr(ev, "data", None) or {}).get("internal"):
+                count += 1
+        return count
 
     def _max_prompt(ckpts: list[dict[str, Any]]) -> int:
         return max((int(c.get("prompt") or 0) for c in ckpts), default=0)
@@ -1183,6 +1221,7 @@ def register(api: Any) -> None:
         if prompt is not None:
             state.prompt_counter = prompt_no
             state.last_prompt_id = prompt[0]
+        state.redo_stack.clear()  # new work: the undone timeline is gone for /redo
 
         sha = _short_hash("HEAD")
         checkpoint: dict[str, Any] = {
@@ -1230,6 +1269,7 @@ def register(api: Any) -> None:
             return error
         n = n if n and n >= 1 else 1
         force = bool(flags & {"--force", "-f"})
+        dry_run = "--dry-run" in flags
 
         if n > len(state.checkpoints):
             ctx.logger.warning(
@@ -1239,6 +1279,18 @@ def register(api: Any) -> None:
             )
             return f"✗ only {len(state.checkpoints)} checkpoint(s) available, cannot undo {n}"
 
+        keep_count = len(state.checkpoints) - n
+        target_ref = _checkpoint_boundary_ref(keep_count)
+        if not target_ref:
+            ctx.logger.warning(
+                "shadow-branching: cannot resolve checkpoint boundary for undo %d", n
+            )
+            return f"✗ cannot resolve checkpoint boundary for undo {n}"
+        suffix = f" ({ref} and later)" if ref else ""
+        dropped = _shortstat(target_ref, "HEAD")
+        if dry_run:
+            return f"• /undo would drop {n} checkpoint(s){suffix} · {dropped} — nothing changed"
+
         dirty = _has_changes()
         if dirty and not force:
             ctx.logger.warning(
@@ -1247,13 +1299,7 @@ def register(api: Any) -> None:
             )
             return "✗ uncommitted changes present — commit/stash or use --force"
 
-        keep_count = len(state.checkpoints) - n
-        target_ref = _checkpoint_boundary_ref(keep_count)
-        if not target_ref:
-            ctx.logger.warning(
-                "shadow-branching: cannot resolve checkpoint boundary for undo %d", n
-            )
-            return f"✗ cannot resolve checkpoint boundary for undo {n}"
+        _, from_sha, _ = _run_git("rev-parse", "HEAD")
 
         rc, _, err = _run_git("reset", "--hard", target_ref)
         if rc != 0:
@@ -1291,22 +1337,182 @@ def register(api: Any) -> None:
             sha,
             [c["turn"] for c in removed],
         )
+        # /redo may re-apply this undo while nothing new has happened: same
+        # branch, same checkpoints, no new prompt in the (reloaded) session.
+        state.redo_stack.append(
+            {
+                "branch": state.shadow_branch,
+                "from": from_sha,
+                "keep": keep_count,
+                "removed": removed,
+                "prompts": _real_prompt_count(ctx),
+            }
+        )
         _sync_metadata(ctx)
-        suffix = f" ({ref} and later)" if ref else ""
-        return f"↩ reverted {n} checkpoint(s){suffix} → {sha}"
+        return f"↩ reverted {n} checkpoint(s){suffix} → {sha} · dropped {dropped} · /redo restores"
 
     @_command(
         "undo",
         "Revert the last N checkpoints (default 1), or back to before tN / pN / <sha>. "
-        "Use --force with a dirty tree.",
-        hint="[N | tN | pN] [--force]",
+        "Use --force with a dirty tree, --dry-run to preview.",
+        hint="[N | tN | pN] [--force] [--dry-run]",
     )
     def cmd_undo(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
 
-    @_command("revert", "Alias for /undo", hint="[N | tN | pN] [--force]")
+    @_command("revert", "Alias for /undo", hint="[N | tN | pN] [--force] [--dry-run]")
     def cmd_revert(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
+
+    # ------------------------------------------------------------------
+    # /redo
+    # ------------------------------------------------------------------
+
+    @_command(
+        "redo",
+        "Re-apply what the last /undo removed — only while nothing new happened since.",
+        hint="[--force]",
+    )
+    def cmd_redo(args: str, ctx: Any) -> str | None:
+        if state is None or not state.enabled:
+            return f"✗ {_disabled_reason()}"
+        if not state.redo_stack:
+            return "• nothing to redo"
+        entry = state.redo_stack[-1]
+        if entry.get("branch") != state.shadow_branch or len(state.checkpoints) != entry.get(
+            "keep"
+        ):
+            state.redo_stack.clear()
+            _sync_metadata(ctx)
+            return "✗ cannot redo — the timeline changed since the /undo"
+        if _real_prompt_count(ctx) != entry.get("prompts"):
+            state.redo_stack.clear()
+            _sync_metadata(ctx)
+            return "✗ cannot redo — the conversation moved on since the /undo"
+        force = any(t in ("--force", "-f") for t in args.split())
+        dirty = _has_changes()
+        if dirty and not force:
+            return "✗ uncommitted changes present — commit/stash or use --force"
+
+        rc, _, err = _run_git("reset", "--hard", str(entry["from"]))
+        if rc != 0:
+            return f"✗ git reset failed: {err}"
+        if dirty and force:
+            _run_git("clean", "-fd")
+        state.redo_stack.pop()
+        removed = list(entry.get("removed") or [])
+        state.checkpoints = state.checkpoints + removed
+        state.turn_counter = len(state.checkpoints)
+
+        session = getattr(ctx, "session", None)
+        if session is not None and not reload_session_from_disk(session, logger=ctx.logger):
+            ctx.logger.warning("shadow-branching: could not reload session events after /redo")
+        sha = _short_hash("HEAD")
+        _sync_metadata(ctx)
+        more = f" · {len(state.redo_stack)} more /redo" if state.redo_stack else ""
+        return f"↪ restored {len(removed)} checkpoint(s) → {sha}{more}"
+
+    # ------------------------------------------------------------------
+    # /restore
+    # ------------------------------------------------------------------
+
+    @_command(
+        "restore",
+        "Put one file back to how it was before a checkpoint or prompt (default: before "
+        "the last checkpoint that changed it). Recorded as a new checkpoint.",
+        hint="<path> [tN | pN | sha] [--force]",
+    )
+    def cmd_restore(args: str, ctx: Any) -> str | None:
+        if state is None or not state.enabled:
+            return f"✗ {_disabled_reason()}"
+        usage = "✗ usage: /restore <path> [tN | pN | <sha>] [--force]"
+        tokens = args.split()
+        force = any(t in ("--force", "-f") for t in tokens)
+        ckpts = state.checkpoints
+        refs = [t for t in tokens if not t.startswith("-") and _find_ref(t, ckpts) is not None]
+        paths = [t for t in tokens if not t.startswith("-") and t not in refs]
+        if len(paths) != 1:
+            return usage
+        if not ckpts:
+            return "• no checkpoints yet"
+
+        _, top, _ = _run_git("rev-parse", "--show-toplevel")
+        root = Path(top).resolve() if top else Path.cwd().resolve()
+        target = (Path.cwd() / paths[0]).resolve()
+        try:
+            rel = target.relative_to(root).as_posix()
+        except ValueError:
+            return f"✗ {paths[0]} is outside the repository"
+        if rel.startswith(".git/") or rel == ".git":
+            return usage
+        spec = f":(top){rel}"
+
+        if refs:
+            label, idx = _find_ref(refs[0], ckpts) or ("", None)
+            if idx is None:
+                return f"✗ no {label} on {_short_branch(state.shadow_branch, state.session_id)}"
+        else:
+            idx = next(
+                (
+                    i
+                    for i in range(len(ckpts) - 1, -1, -1)
+                    if rel in _checkpoint_stats(ckpts[i]["hash"])["paths"]
+                ),
+                None,
+            )
+            if idx is None:
+                return f"✗ no checkpoint changed {rel} — name one: /restore {rel} t3"
+            label = f"t{ckpts[idx]['turn']}"
+        rev = f"{ckpts[idx]['hash']}^"
+
+        rc, status_out, _ = _run_git("status", "--porcelain", "--", spec)
+        if rc == 0 and status_out and not force:
+            return f"✗ {rel} has uncommitted changes — commit them or use --force"
+
+        existed = _run_git("cat-file", "-e", f"{rev}:{rel}")[0] == 0
+        if existed:
+            rc, _, err = _run_git("checkout", rev, "--", spec)
+        else:
+            rc, _, err = _run_git("rm", "-q", "-f", "--ignore-unmatch", "--", spec)
+            (root / rel).unlink(missing_ok=True)
+        if rc != 0:
+            return f"✗ cannot restore {rel}: {err}"
+        _run_git("add", "-A", "--", spec)
+        if _run_git("diff", "--cached", "--quiet")[0] == 0:
+            return f"• {rel} already matches its state before {label}"
+
+        state.turn_counter += 1
+        text = f"/restore {rel}"
+        rc, out, err = _run_git(
+            "commit",
+            "-m",
+            f"shadow-auto: restore turn-{state.turn_counter}",
+            "-m",
+            f"{_PROMPT_TEXT_TRAILER}: {text}",
+            "--no-verify",
+        )
+        if rc != 0:
+            state.turn_counter -= 1
+            return f"✗ checkpoint commit failed: {(out or err or '(no output)').strip()}"
+        sha = _short_hash("HEAD")
+        stats = _checkpoint_stats(sha)
+        state.checkpoints.append(
+            {
+                "turn": state.turn_counter,
+                "hash": sha,
+                "tool": "restore",
+                "files": stats["files"],
+                "flagged": stats["flagged"],
+                "prompt_text": text,
+            }
+        )
+        state.redo_stack.clear()
+        _sync_metadata(ctx)
+        how = "to its state" if existed else "(removed — it did not exist)"
+        return (
+            f"⟲ restored {rel} {how} before {label} · checkpoint t{state.turn_counter} "
+            f"{sha} · {_stat_text(stats)} · /undo t{state.turn_counter} takes it back"
+        )
 
     # ------------------------------------------------------------------
     # /branch
@@ -1437,6 +1643,7 @@ def register(api: Any) -> None:
                     "conversation history may include events from the preserved branch"
                 )
 
+        state.redo_stack.clear()
         _sync_metadata(ctx)
         suffix = f" (rewound {n} checkpoint(s))" if n else ""
         return f"⑂ branch-{branch_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
@@ -1528,6 +1735,7 @@ def register(api: Any) -> None:
         state.checkpoints = ckpts
         state.prompt_counter = max(state.prompt_counter, _max_prompt(ckpts))
         state.last_prompt_id = ""
+        state.redo_stack.clear()
 
         # ── Reload session events from the target branch's JSONL ──────
         # After git checkout the JSONL on disk reflects the target branch's
@@ -1715,13 +1923,28 @@ def register(api: Any) -> None:
     @_command(
         "done",
         "Squash-merge the active shadow branch into its recorded base; aborts on conflicts.",
-        hint="[message] [--yes]",
+        hint="[message] [--yes] [--dry-run]",
     )
     def cmd_done(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
             reason = _disabled_reason()
             ctx.logger.warning("shadow-branching: %s", reason)
             return f"✗ {reason}"
+
+        # Preview first: --dry-run must not sweep, commit or check anything out.
+        if "--dry-run" in args.split():
+            base = _read_anchor_base(state.shadow_branch, state.original_branch or "main")
+            stat = _shortstat(f"{base}...{state.shadow_branch}")
+            forks = _list_branches(f"shadow/session-{state.session_id}-branch-*")
+            note = (
+                f" · {len(forks)} preserved branch(es) stay untouched (needs --yes)"
+                if forks
+                else ""
+            )
+            return (
+                f"• /done would squash {len(state.checkpoints)} checkpoint(s) from "
+                f"{state.shadow_branch} into {base} · {stat}{note} — nothing changed"
+            )
 
         # Sweep up session-store writes before checking for a clean tree.
         _auto_commit_pending(ctx, "pre-done sync")
@@ -1809,6 +2032,7 @@ def register(api: Any) -> None:
         # of this session (``--session <id>``) stays disarmed as well.
         state.enabled = False
         state.mode = "done"
+        state.redo_stack.clear()
         _sync_metadata(ctx)  # pops the stale _active_states entry
         return f"✓ squashed {state.shadow_branch} → {base} as {sha}"
 
@@ -2163,6 +2387,36 @@ def register(api: Any) -> None:
             _stats_cache.clear()
             return None
 
+        # -- previews: what a destructive action would do (confirm dialog) --
+
+        def _preview_drop(node: UINode, ctx: Any) -> str | None:
+            st = state
+            n = int(node.data.get("n_back", 0))
+            if st is None or n <= 0 or not node.data.get("active_branch", True):
+                return None
+            boundary = _checkpoint_boundary_ref(len(st.checkpoints) - n)
+            if not boundary:
+                return None
+            return f"drops {n} checkpoint(s) · {_shortstat(boundary, 'HEAD')} · /redo restores"
+
+        def _preview_delete(node: UINode, ctx: Any) -> str | None:
+            st = state
+            name = str(node.data.get("name", ""))
+            if st is None or not name or node.data.get("active"):
+                return None
+            cps = _checkpoints_of(name)
+            stat = _shortstat(f"{st.original_branch}...{name}")
+            return f"{len(cps)} checkpoint(s) · {stat} vs {st.original_branch}"
+
+        def _preview_done(node: UINode, ctx: Any) -> str | None:
+            return cmd_done("--dry-run", ctx)
+
+        def _action(*args: Any, preview: Any = None, **kwargs: Any) -> UIAction:
+            """``UIAction`` with a preview where the core supports one."""
+            if _ACTION_HAS_PREVIEW and preview is not None:
+                kwargs["preview"] = preview
+            return UIAction(*args, **kwargs)
+
         def _status(ctx: Any) -> str:
             st = state
             if st is None or not st.enabled:
@@ -2178,7 +2432,7 @@ def register(api: Any) -> None:
             status=_status,
             **panel_kwargs,
             actions=[
-                UIAction(
+                _action(
                     "undo",
                     "undo to here",
                     "u",
@@ -2190,10 +2444,11 @@ def register(api: Any) -> None:
                         "Later checkpoints are dropped (they stay reachable in git reflog)."
                     ),
                     inputs=("force",),
+                    preview=_preview_drop,
                 ),
-                UIAction("branch", "fork here", "b", ("checkpoint", "branch"), _act_branch),
-                UIAction("switch", "switch", "s", ("branch",), _act_switch),
-                UIAction(
+                _action("branch", "fork here", "b", ("checkpoint", "branch"), _act_branch),
+                _action("switch", "switch", "s", ("branch",), _act_switch),
+                _action(
                     "undo_prompt",
                     "undo prompt",
                     "u",
@@ -2205,10 +2460,11 @@ def register(api: Any) -> None:
                         "Dropped checkpoints stay reachable in git reflog."
                     ),
                     inputs=("force",),
+                    preview=_preview_drop,
                 ),
-                UIAction("retry_prompt", "retry from before", "b", ("prompt",), _act_retry_prompt),
-                UIAction("diff", "diff", "d", ("checkpoint", "prompt"), _act_diff, mutates=False),
-                UIAction(
+                _action("retry_prompt", "retry from before", "b", ("prompt",), _act_retry_prompt),
+                _action("diff", "diff", "d", ("checkpoint", "prompt"), _act_diff, mutates=False),
+                _action(
                     "delete",
                     "delete",
                     "x",
@@ -2216,8 +2472,9 @@ def register(api: Any) -> None:
                     _act_delete,
                     destructive=True,
                     confirm="Delete {label}? The branch is only recoverable via git reflog.",
+                    preview=_preview_delete,
                 ),
-                UIAction(
+                _action(
                     "done",
                     "squash → base",
                     "D",
@@ -2229,8 +2486,9 @@ def register(api: Any) -> None:
                         "shadow mode for this session?"
                     ),
                     inputs=("message",),
+                    preview=_preview_done,
                 ),
-                UIAction(
+                _action(
                     "refresh",
                     "refresh",
                     "r",

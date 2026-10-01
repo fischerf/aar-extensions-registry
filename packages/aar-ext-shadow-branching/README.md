@@ -100,11 +100,14 @@ message.
 |---|---|
 | `/undo [N \| tN \| pN \| <sha>] [--force]` | Revert N logical checkpoints (default 1), or everything from the named checkpoint / prompt onwards (see **References** below), skipping `shadow-meta` commits and reloading session events to the restored timeline. Refuses to run with a dirty tree unless `--force` is passed. Returns `↩ reverted N checkpoint(s) (t3 and later) → <sha>`. |
 | `/revert …` | Alias for `/undo`. |
+| `/undo … --dry-run` | Preview only: `• /undo would drop 2 checkpoint(s) (p2 and later) · 3 files +40 −12 — nothing changed`. A real `/undo` reports the same `dropped …` stat. |
+| `/redo [--force]` | Re-apply what the last `/undo` removed (repeatable for several undos). Only while nothing new happened since — a new checkpoint, `/branch`, `/switch`, `/restore` or `/done` clears it, and a new prompt makes it refuse (`✗ cannot redo — the conversation moved on since the /undo`). Reloads the session events like `/undo`. |
+| `/restore <path> [tN \| pN \| <sha>] [--force]` | Put **one file** back to how it was just before the named checkpoint / prompt — by default before the last checkpoint that changed it. A file that did not exist then is removed. Recorded as its own checkpoint (`/restore <path>` group, tool `restore`), so `/undo` takes it back. Refuses a file with uncommitted changes unless `--force`. |
 | `/branch [N \| tN \| pN \| <sha>]` | Preserve active shadow as `shadow/session-<id>-branch-<K>` and start a fresh branch from N logical checkpoints back — or from just before the named checkpoint / prompt, i.e. "retry p2 differently" — (or `HEAD` if nothing is given), skipping `shadow-meta` commits when counting. Reloads session events from the fork point's JSONL so the LLM context matches the new branch. Multiple branches are allowed. Returns `⑂ branch-K preserved as <branch> — now on fresh <branch>`. |
 | `/switch [<target>]` | Switch to any shadow/branch copy for **this** session. Reloads the session's conversation history from the target branch's JSONL so the LLM context matches the files on disk. Rejects branches belonging to other sessions. See **Switch shorthands** below. Returns `⇄ switched to <branch> (base=<base>, N checkpoint(s), M events)`. |
 | `/branches` | Tree of every shadow/branch copy for this session (canonical first, active marked `◀ active`) with its newest checkpoints — turn, tool, SHA, diffstat, age, `⚠` / `◀ tip` markers — the base anchor, and pending changes. Plain text, so it reads the same in every transport. |
 | `/diff [tN \| pN \| <sha>] [--patch]` | What a checkpoint (default: the latest) or a whole prompt changed, as `git --stat`; `--patch` adds the unified diff (coloured in the TUIs, a `diff` code block in editors). Session files under `.agent/` are left out of prompt diffs. |
-| `/done [message] [--yes]` | Squash-merge the active shadow back into the base branch recorded in the `shadow-init` anchor. If preserved branches still exist it refuses unless `--yes` is passed. On conflicts it stops without committing, prints the paths, and leaves unresolved merge state on the base. Message parsing drops flags and integer-only tokens. Returns `✓ squashed <shadow> → <base> as <sha>`. |
+| `/done [message] [--yes] [--dry-run]` | Squash-merge the active shadow back into the base branch recorded in the `shadow-init` anchor. If preserved branches still exist it refuses unless `--yes` is passed. On conflicts it stops without committing, prints the paths, and leaves unresolved merge state on the base. Message parsing drops flags and integer-only tokens. `--dry-run` previews the squash (checkpoints, diffstat vs base, preserved branches) without sweeping, committing or checking out anything. Returns `✓ squashed <shadow> → <base> as <sha>`. |
 
 Error and warning returns use `✗` and `⚠` prefixes respectively.
 
@@ -239,6 +242,9 @@ title close it; the sidebar follows the selection you made in the window.
 
 * Newest checkpoint on top; `●` marks the tip, `⚠` a checkpoint that touched a
   sensitive-looking path, `(N cp)` a collapsed branch, `✎` uncommitted changes.
+* Destructive actions show a preview in their confirm dialog — what an undo
+  drops (`drops 3 checkpoint(s) · 4 files +60 −12 · /redo restores`), what a
+  deleted branch holds, what `/done` would squash.
 * Action keys only work while the panel has focus (`ctrl+b` focuses the
   sidebar, again returns to the input, `esc` hides it). Mutating actions are
   refused while the agent is running; `diff` / `refresh` stay available.
