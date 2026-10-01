@@ -478,3 +478,50 @@ def test_age_and_short_branch_helpers() -> None:
     assert _short_branch("shadow/session-ab-branch-2", "ab") == "branch-2"
     assert _short_branch("shadow/session-ab-branch-1-branch-2", "ab") == "branch-1-branch-2"
     assert _short_branch("main", "ab") == "main"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint note on the tool result, command hints
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_note_attached_to_tool_result(session_api) -> None:
+    from agent.core.events import ToolResult
+    from agent.extensions.api import tool_result_notes
+
+    api, ctx, repo = session_api
+    (repo / "a.txt").write_text("one\ntwo\n", encoding="utf-8")
+    tr = ToolResult(tool_name="write_file", output="ok")
+    for handler in api.handlers["tool_result"]:
+        handler(tr, ctx)
+    sha = _session_state(ctx)["checkpoints"][-1]["hash"]
+    assert tool_result_notes(tr) == [f"⎇ checkpoint t1 · {sha} · 1 file +2 −0"]
+
+    # No changes → no checkpoint → no note.
+    tr2 = ToolResult(tool_name="read_file", output="ok")
+    for handler in api.handlers["tool_result"]:
+        handler(tr2, ctx)
+    assert tool_result_notes(tr2) == []
+
+    # Sensitive paths are called out on the note too.
+    (repo / ".env").write_text("S=1", encoding="utf-8")
+    tr3 = ToolResult(tool_name="write_file", output="ok")
+    for handler in api.handlers["tool_result"]:
+        handler(tr3, ctx)
+    assert tool_result_notes(tr3)[0].endswith("· ⚠ sensitive path")
+
+
+def test_commands_declare_argument_hints(repo) -> None:
+    from agent.extensions.api import ExtensionAPI
+    from test_shadow_branching import register
+
+    api = ExtensionAPI("shadow_branching")
+    register(api)
+    assert api._command_hints == {
+        "undo": "[N] [--force]",
+        "revert": "[N] [--force]",
+        "branch": "[N]",
+        "switch": "[main | K | branch-K]",
+        "done": "[message] [--yes]",
+    }
+    assert "branches" in api._commands

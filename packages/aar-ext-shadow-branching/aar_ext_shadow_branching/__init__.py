@@ -58,6 +58,7 @@ rejected with a descriptive message.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import subprocess
 import time
@@ -83,6 +84,21 @@ except ImportError:  # pragma: no cover — older core
     _HAS_PANEL_API = False
     _NODE_HAS_DETAIL = False
     _PANEL_HAS_DESCRIBE = False
+
+
+# Display-only notes on tool results (checkpoint line under the result / on the
+# editor's tool-call card).  Newer cores export the helper; the fallback writes
+# the same ``data["notes"]`` list an older core simply never displays.
+try:
+    from agent.extensions.api import add_tool_result_note as _add_note
+except ImportError:  # pragma: no cover — older core
+
+    def _add_note(event: Any, text: str) -> bool:
+        data = getattr(event, "data", None)
+        if not isinstance(data, dict):
+            return False
+        data.setdefault("notes", []).append(text)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +598,18 @@ def register(api: Any) -> None:
     # Helpers (close over ``state`` and ``ctx``)
     # ------------------------------------------------------------------
 
+    try:
+        _command_params = inspect.signature(api.command).parameters
+    except (TypeError, ValueError):  # pragma: no cover — exotic test doubles
+        _command_params = {}
+
+    def _command(name: str, description: str, hint: str = "") -> Any:
+        """``api.command`` with an argument hint where the core supports one
+        (editors show it as the input placeholder)."""
+        if hint and "hint" in _command_params:
+            return api.command(name, description=description, hint=hint)
+        return api.command(name, description=description)
+
     def _sync_metadata(ctx: Any) -> None:
         if state is None or ctx is None:
             return
@@ -1019,6 +1047,13 @@ def register(api: Any) -> None:
             }
         )
         _details_cache[sha] = (files_touched, flagged_any)
+        # One line under this tool's result (TUIs) / on its tool-call card (ACP).
+        stats = _checkpoint_stats(sha)
+        _add_note(
+            event,
+            f"⎇ checkpoint t{state.turn_counter} · {sha} · {_stat_text(stats)}"
+            + (" · ⚠ sensitive path" if flagged_any else ""),
+        )
         ctx.logger.info(
             "[CHECKPOINT turn=%d hash=%s tool=%s]",
             state.turn_counter,
@@ -1104,13 +1139,15 @@ def register(api: Any) -> None:
         _sync_metadata(ctx)
         return f"↩ reverted {n} checkpoint(s) → {sha}"
 
-    @api.command(
-        "undo", description="Revert N checkpoints (default 1). Use --force with dirty tree."
+    @_command(
+        "undo",
+        "Revert N checkpoints (default 1). Use --force with dirty tree.",
+        hint="[N] [--force]",
     )
     def cmd_undo(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
 
-    @api.command("revert", description="Alias for /undo")
+    @_command("revert", "Alias for /undo", hint="[N] [--force]")
     def cmd_revert(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
 
@@ -1118,9 +1155,10 @@ def register(api: Any) -> None:
     # /branch
     # ------------------------------------------------------------------
 
-    @api.command(
+    @_command(
         "branch",
-        description="Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
+        "Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
+        hint="[N]",
     )
     def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
@@ -1247,14 +1285,15 @@ def register(api: Any) -> None:
     # /switch
     # ------------------------------------------------------------------
 
-    @api.command(
+    @_command(
         "switch",
-        description=(
+        (
             "Switch to another shadow/session-<id>* branch. "
             "Shorthands: branch-<K> or bare <K> for a branch, "
             "'main'/'active'/'shadow' for the canonical shadow branch. "
             "No args: show current branch and available targets."
         ),
+        hint="[main | K | branch-K]",
     )
     def cmd_switch(args: str, ctx: Any) -> str | None:
         nonlocal state
@@ -1362,9 +1401,7 @@ def register(api: Any) -> None:
     # /branches
     # ------------------------------------------------------------------
 
-    @api.command(
-        "branches", description="List all shadow/branch copies for this session as a tree."
-    )
+    @_command("branches", "List all shadow/branch copies for this session as a tree.")
     def cmd_branches(args: str, ctx: Any) -> str | None:
         if state is None:
             ctx.logger.info("shadow-branching: not initialised")
@@ -1426,9 +1463,10 @@ def register(api: Any) -> None:
     # /done
     # ------------------------------------------------------------------
 
-    @api.command(
+    @_command(
         "done",
-        description="Squash-merge the active shadow branch into its recorded base; aborts on conflicts.",
+        "Squash-merge the active shadow branch into its recorded base; aborts on conflicts.",
+        hint="[message] [--yes]",
     )
     def cmd_done(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:

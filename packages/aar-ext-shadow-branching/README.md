@@ -220,10 +220,22 @@ title close it; the sidebar follows the selection you made in the window.
 * Hide the sidebar by default with
   `"tui": {"layout": {"extensions": {"shadow_branching": {"visible": false}}}}`.
 
+### Checkpoint notes (every interface)
+
+Each checkpoint is announced on the tool result that caused it — in the result
+panel's bottom border in both TUIs, and as an extra line on the tool-call card in
+editors over ACP (Zed):
+
+```
+╰──────────────── ⎇ checkpoint t4 · e2ebcdc · 1 file +2 −0 ─╯
+```
+
+A checkpoint touching a sensitive-looking path ends in `· ⚠ sensitive path`.
+
 ### Inline TUI (`aar tui`)
 
-`/panel` prints the same tree as a Rich panel with details, and after every turn
-(or slash command) that moved the shadow state a compact version (5 newest
+`/panel` prints the same tree as a Rich panel with details. After a slash command
+that moved the shadow state (`/undo`, `/branch`, …) a compact version (5 newest
 checkpoints per branch) is printed automatically — the layout setting above turns
 that off. `/branches` gives the plain-text tree:
 
@@ -238,6 +250,13 @@ that off. `/branches` gives the plain-text tree:
 │  └─ …
 └─ ✎ 1 untracked (pending)
 ```
+
+### Editors over ACP (Zed)
+
+Commands appear in the editor's `/` menu with argument placeholders
+(`/undo [N] [--force]`, `/switch [main | K | branch-K]`, `/done [message] [--yes]`).
+`/branches` and other tree replies arrive in a code block, so the layout survives
+the editor's Markdown rendering.
 
 The same tree and actions are available to editors over ACP stdio
 (`_aar/panel_list`, `_aar/panel_snapshot`, `_aar/panel_action`,
