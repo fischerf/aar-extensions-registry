@@ -334,6 +334,28 @@ def _checkpoint_stats(sha: str, cwd: str | Path | None = None) -> dict[str, Any]
     return stats
 
 
+# Git trailers on shadow-auto commits that tie a checkpoint to its prompt; the
+# subject line stays ``shadow-auto: <tool> turn-<N>`` as the protocol requires.
+_PROMPT_TRAILER = "Shadow-Prompt"
+_PROMPT_TEXT_TRAILER = "Shadow-Prompt-Text"
+_PROMPT_TEXT_MAX = 120
+
+
+def _prompt_excerpt(text: str, limit: int = _PROMPT_TEXT_MAX) -> str:
+    """First non-empty line of *text*, whitespace collapsed, cut at *limit*."""
+    line = next((ln for ln in str(text).splitlines() if ln.strip()), "")
+    line = " ".join(line.split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _parse_ref(token: str) -> tuple[str, int] | None:
+    """``"t3"`` → ``("t", 3)``, ``"p2"`` → ``("p", 2)``; anything else → ``None``."""
+    tok = token.strip().lower()
+    if len(tok) >= 2 and tok[0] in "tp" and tok[1:].isdigit():
+        return tok[0], int(tok[1:])
+    return None
+
+
 def _age(ts: int, now: float | None = None) -> str:
     """``12s`` / ``5m`` / ``3h`` / ``2d`` ago; ``""`` for an unknown time."""
     if ts <= 0:
@@ -400,6 +422,10 @@ class ShadowState:
     base_anchor: str = ""
     enabled: bool = True
     mode: str = "git"  # "git" or "fallback" (.shadow_backups)
+    # Prompts that produced checkpoints are numbered p1, p2, … — monotonic so
+    # a number is never reused for a different prompt (not even after /undo).
+    prompt_counter: int = 0
+    last_prompt_id: str = ""  # UserMessage.id the current prompt number belongs to
 
     def to_metadata(self) -> dict[str, Any]:
         return asdict(self)
@@ -640,16 +666,17 @@ def register(api: Any) -> None:
 
     def _reconstruct_from_branch(branch: str) -> tuple[int, list[dict[str, Any]]]:
         """Count shadow-auto commits on *branch* and build a checkpoint list."""
-        rc, out, _ = _run_git("log", "--reverse", "--format=%h %s", branch)
+        rc, out, _ = _run_git("log", "--reverse", "--format=%h%x1f%s%x1f%b%x1e", branch)
         if rc != 0 or not out:
             return 0, []
         turn = 0
         ckpts: list[dict[str, Any]] = []
-        for line in out.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) != 2:
+        for record in out.split("\x1e"):
+            parts = record.strip("\n").split("\x1f")
+            if len(parts) < 2:
                 continue
-            sha, msg = parts
+            sha, msg = parts[0].strip(), parts[1]
+            body = parts[2] if len(parts) > 2 else ""
             if not msg.startswith("shadow-auto:"):
                 continue
             turn += 1
@@ -660,8 +687,65 @@ def register(api: Any) -> None:
                 tool = after.split(" turn-", 1)[0]
             except Exception:
                 pass
-            ckpts.append({"turn": turn, "hash": sha, "tool": tool})
+            cp: dict[str, Any] = {"turn": turn, "hash": sha, "tool": tool}
+            for line in body.splitlines():
+                key, _, value = line.partition(":")
+                if key == _PROMPT_TRAILER and value.strip().isdigit():
+                    cp["prompt"] = int(value.strip())
+                elif key == _PROMPT_TEXT_TRAILER:
+                    cp["prompt_text"] = value.strip()
+            ckpts.append(cp)
         return turn, ckpts
+
+    def _prompt_groups(
+        ckpts: list[dict[str, Any]],
+    ) -> list[tuple[int, str, list[tuple[int, dict[str, Any]]]]]:
+        """Group checkpoints by prompt, oldest first: ``(prompt_no, text,
+        [(index, checkpoint), …])``.  ``prompt_no`` 0 collects checkpoints that
+        predate prompt tracking.  Empty list when *no* checkpoint has a prompt —
+        callers then keep the flat layout."""
+        if not any(c.get("prompt") for c in ckpts):
+            return []
+        groups: list[tuple[int, str, list[tuple[int, dict[str, Any]]]]] = []
+        for i, cp in enumerate(ckpts):
+            no = int(cp.get("prompt") or 0)
+            if groups and groups[-1][0] == no:
+                groups[-1][2].append((i, cp))
+            else:
+                groups.append((no, str(cp.get("prompt_text", "")), [(i, cp)]))
+        return groups
+
+    def _group_stats(items: list[tuple[int, dict[str, Any]]]) -> tuple[int, int]:
+        added = removed = 0
+        for _, cp in items:
+            st = _checkpoint_stats(cp["hash"])
+            added += st["added"]
+            removed += st["removed"]
+        return added, removed
+
+    def _prompt_title(no: int, text: str, limit: int = 40) -> str:
+        if not no:
+            return "earlier checkpoints"
+        return f'p{no} "{_prompt_excerpt(text, limit)}"' if text else f"p{no}"
+
+    def _max_prompt(ckpts: list[dict[str, Any]]) -> int:
+        return max((int(c.get("prompt") or 0) for c in ckpts), default=0)
+
+    def _current_prompt(ctx: Any) -> tuple[str, str] | None:
+        """(id, text) of the latest real user prompt in the session, if any.
+
+        Loop-internal nudges (``data["internal"]``) are not prompts.
+        """
+        events = getattr(getattr(ctx, "session", None), "events", None) or []
+        for ev in reversed(events):
+            etype = getattr(getattr(ev, "type", None), "value", getattr(ev, "type", None))
+            if etype != "user_message":
+                continue
+            data = getattr(ev, "data", None) or {}
+            if data.get("internal"):
+                continue
+            return str(getattr(ev, "id", "")), str(getattr(ev, "content", "") or "")
+        return None
 
     # branch -> (tip sha, checkpoints).  Sibling branches don't move unless the
     # user switches to them, so the tip SHA is a safe key.  Used by /branches
@@ -757,6 +841,53 @@ def register(api: Any) -> None:
                 except ValueError:
                     pass
         return n, flags
+
+    def _resolve_back(args: str) -> tuple[int | None, set[str], str, str]:
+        """Parse ``N`` / ``tN`` / ``pN`` plus flags into a count of checkpoints
+        to drop from the tip of the active branch.
+
+        Returns ``(n, flags, ref, error)``.  ``tN`` / ``pN`` rewind to just
+        *before* that checkpoint / the prompt's first checkpoint, so the named
+        work is what gets dropped.  ``ref`` echoes the name for messages.
+        """
+        ckpts = state.checkpoints if state is not None else []
+        for tok in args.split():
+            hit = _find_ref(tok, ckpts)
+            if hit is None:
+                continue
+            label, idx = hit
+            flags = {t for t in args.split() if t.startswith("-")}
+            if idx is None:
+                where = _short_branch(state.shadow_branch, state.session_id) if state else "?"
+                return None, flags, tok, f"✗ no {label} on {where} — see /branches"
+            return len(ckpts) - idx, flags, label, ""
+        n, flags = _parse_int_arg(args)
+        return n, flags, "", ""
+
+    def _find_ref(tok: str, ckpts: list[dict[str, Any]]) -> tuple[str, int | None] | None:
+        """Resolve one argument token naming a checkpoint or prompt.
+
+        ``tN`` (checkpoint position on the active line — renumbered after
+        /undo), ``pN`` (prompt — never reused) or a checkpoint SHA (>= 7 hex
+        chars, unambiguous across /undo).  Returns ``(label, index of the first
+        matching checkpoint or None)``, or ``None`` when *tok* is not a ref.
+        """
+        ref = _parse_ref(tok)
+        if ref is not None:
+            kind, num = ref
+            key = "turn" if kind == "t" else "prompt"
+            idx = next((i for i, c in enumerate(ckpts) if c.get(key) == num), None)
+            what = "checkpoint" if kind == "t" else "prompt"
+            return (f"{kind}{num}" if idx is not None else f"{what} {kind}{num}"), idx
+        low = tok.lower()
+        if len(low) >= 7 and all(ch in "0123456789abcdef" for ch in low):
+            for i, c in enumerate(ckpts):
+                sha = str(c.get("hash", ""))
+                if sha and (sha.startswith(low) or low.startswith(sha)):
+                    return sha, i
+            # An all-digit token is far more likely a count than a SHA.
+            return None if low.isdigit() else (f"checkpoint {low[:7]}", None)
+        return None
 
     # ------------------------------------------------------------------
     # session_start — reconnaissance + branch setup
@@ -891,6 +1022,7 @@ def register(api: Any) -> None:
                 shadow_branch=shadow_name,
                 turn_counter=turn,
                 checkpoints=ckpts,
+                prompt_counter=_max_prompt(ckpts),
                 branch_counter=max(0, branch_counter),
                 base_anchor=_short_hash(shadow_name + "^{/^shadow-init:}") or _short_hash("HEAD"),
             )
@@ -1024,35 +1156,56 @@ def register(api: Any) -> None:
         if rc_diff == 0:
             state.turn_counter = prev_turn
             return
-        rc, out, err = _run_git(
-            "commit",
-            "-m",
-            f"shadow-auto: {tool_name} turn-{state.turn_counter}",
-            "--no-verify",
-        )
+        # Which prompt is this checkpoint part of?  A new UserMessage id means
+        # a new prompt number; the number is committed only with the commit.
+        prompt = _current_prompt(ctx)
+        prompt_no = 0
+        prompt_text = ""
+        message = [f"shadow-auto: {tool_name} turn-{state.turn_counter}"]
+        if prompt is not None:
+            prompt_id, raw_text = prompt
+            prompt_no = (
+                state.prompt_counter
+                if prompt_id == state.last_prompt_id and state.prompt_counter
+                else state.prompt_counter + 1
+            )
+            prompt_text = _prompt_excerpt(raw_text)
+            message += [
+                "-m",
+                f"{_PROMPT_TRAILER}: {prompt_no}\n{_PROMPT_TEXT_TRAILER}: {prompt_text}",
+            ]
+        rc, out, err = _run_git("commit", "-m", *message, "--no-verify")
         if rc != 0:
             detail = (out or err or "(no output)").strip()
             ctx.logger.warning("shadow-branching: checkpoint commit failed: %s", detail)
             state.turn_counter = prev_turn
             return
+        if prompt is not None:
+            state.prompt_counter = prompt_no
+            state.last_prompt_id = prompt[0]
 
         sha = _short_hash("HEAD")
-        state.checkpoints.append(
-            {
-                "turn": state.turn_counter,
-                "hash": sha,
-                "tool": tool_name,
-                "files": files_touched,
-                "flagged": flagged_any,
-            }
-        )
+        checkpoint: dict[str, Any] = {
+            "turn": state.turn_counter,
+            "hash": sha,
+            "tool": tool_name,
+            "files": files_touched,
+            "flagged": flagged_any,
+        }
+        if prompt_no:
+            checkpoint["prompt"] = prompt_no
+            checkpoint["prompt_text"] = prompt_text
+        state.checkpoints.append(checkpoint)
         _details_cache[sha] = (files_touched, flagged_any)
         # One line under this tool's result (TUIs) / on its tool-call card (ACP).
         stats = _checkpoint_stats(sha)
         _add_note(
             event,
-            f"⎇ checkpoint t{state.turn_counter} · {sha} · {_stat_text(stats)}"
-            + (" · ⚠ sensitive path" if flagged_any else ""),
+            f"⎇ checkpoint t{state.turn_counter}"
+            + (f" (p{prompt_no})" if prompt_no else "")
+            + f" · {sha} · {_stat_text(stats)}"
+            + (" · ⚠ sensitive path" if flagged_any else "")
+            + f" · /undo t{state.turn_counter}",
         )
         ctx.logger.info(
             "[CHECKPOINT turn=%d hash=%s tool=%s]",
@@ -1072,7 +1225,9 @@ def register(api: Any) -> None:
             ctx.logger.warning("shadow-branching: %s", reason)
             return f"✗ {reason}"
 
-        n, flags = _parse_int_arg(args)
+        n, flags, ref, error = _resolve_back(args)
+        if error:
+            return error
         n = n if n and n >= 1 else 1
         force = bool(flags & {"--force", "-f"})
 
@@ -1137,17 +1292,19 @@ def register(api: Any) -> None:
             [c["turn"] for c in removed],
         )
         _sync_metadata(ctx)
-        return f"↩ reverted {n} checkpoint(s) → {sha}"
+        suffix = f" ({ref} and later)" if ref else ""
+        return f"↩ reverted {n} checkpoint(s){suffix} → {sha}"
 
     @_command(
         "undo",
-        "Revert N checkpoints (default 1). Use --force with dirty tree.",
-        hint="[N] [--force]",
+        "Revert the last N checkpoints (default 1), or back to before tN / pN / <sha>. "
+        "Use --force with a dirty tree.",
+        hint="[N | tN | pN] [--force]",
     )
     def cmd_undo(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
 
-    @_command("revert", "Alias for /undo", hint="[N] [--force]")
+    @_command("revert", "Alias for /undo", hint="[N | tN | pN] [--force]")
     def cmd_revert(args: str, ctx: Any) -> str | None:
         return _do_undo(args, ctx)
 
@@ -1157,8 +1314,9 @@ def register(api: Any) -> None:
 
     @_command(
         "branch",
-        "Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch (optionally from N back).",
-        hint="[N]",
+        "Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch "
+        "(optionally from N back, or from before tN / pN).",
+        hint="[N | tN | pN]",
     )
     def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
@@ -1195,7 +1353,9 @@ def register(api: Any) -> None:
                 "then retry /branch"
             )
 
-        n, _ = _parse_int_arg(args)
+        n, _, _ref, error = _resolve_back(args)
+        if error:
+            return error
         if n is not None and n > len(state.checkpoints):
             ctx.logger.warning(
                 "shadow-branching: only %d checkpoints, cannot branch %d back",
@@ -1366,6 +1526,8 @@ def register(api: Any) -> None:
         state.original_branch = base
         state.turn_counter = turn
         state.checkpoints = ckpts
+        state.prompt_counter = max(state.prompt_counter, _max_prompt(ckpts))
+        state.last_prompt_id = ""
 
         # ── Reload session events from the target branch's JSONL ──────
         # After git checkout the JSONL on disk reflects the target branch's
@@ -1421,6 +1583,7 @@ def register(api: Any) -> None:
         ordered += sorted(b for b in branches if b.startswith(fork_prefix))
         # Show at most this many checkpoints per branch, newest first.
         max_cps = 5 if len(ordered) > 1 else 10
+        # Refs work in every command: /undo t3 · /branch p2 · /diff p2
         now = time.time()
 
         lines: list[str] = [
@@ -1438,26 +1601,112 @@ def register(api: Any) -> None:
             dot = "●" if active else "○"
             lines.append(f"{head} {dot} {b}  ({len(cps)} cp){marker}")
             ctx.logger.info("  * %s%s", b, " (active)" if active else "")
-            shown = list(reversed(cps))[:max_cps]
-            hidden = len(cps) - len(shown)
-            tool_w = max((len(str(c.get("tool", ""))) for c in shown), default=0)
-            for ci, cp in enumerate(shown):
-                last_cp = ci == len(shown) - 1 and not hidden
-                twig = "└─" if last_cp else "├─"
+            tool_w = max((len(str(c.get("tool", ""))) for c in cps), default=0)
+            tip_hash = cps[-1]["hash"] if active and cps else ""
+
+            def cp_line(cp: dict[str, Any], tip_hash: str = tip_hash, tool_w: int = tool_w) -> str:
                 stats = _checkpoint_stats(cp["hash"])
                 age = _age(stats["time"], now)
                 flags = ("  ⚠" if stats["flagged"] else "") + (
-                    "  ◀ tip" if active and ci == 0 else ""
+                    "  ◀ tip" if cp["hash"] == tip_hash else ""
                 )
-                lines.append(
-                    f"{stem}{twig} t{cp['turn']:<3} {cp['tool']!s:<{tool_w}}  {cp['hash']}  "
+                return (
+                    f"t{cp['turn']:<3} {cp['tool']!s:<{tool_w}}  {cp['hash']}  "
                     f"{_stat_text(stats)}" + (f"  {age}" if age else "") + flags
                 )
-            if hidden:
-                lines.append(f"{stem}└─ … {hidden} older")
+
+            groups = _prompt_groups(cps)
+            if not groups:
+                shown = list(reversed(cps))[:max_cps]
+                hidden = len(cps) - len(shown)
+                for ci, cp in enumerate(shown):
+                    twig = "└─" if ci == len(shown) - 1 and not hidden else "├─"
+                    lines.append(f"{stem}{twig} {cp_line(cp)}")
+                if hidden:
+                    lines.append(f"{stem}└─ … {hidden} older")
+                continue
+            # Grouped by prompt, newest prompt first; at most 4 prompts and 4
+            # checkpoints per prompt are listed.
+            shown_groups = list(reversed(groups))[:4]
+            hidden_groups = len(groups) - len(shown_groups)
+            for gi, (no, text, items) in enumerate(shown_groups):
+                last_group = gi == len(shown_groups) - 1 and not hidden_groups
+                g_twig = "└─" if last_group else "├─"
+                g_stem = stem + ("   " if last_group else "│  ")
+                added, removed = _group_stats(items)
+                lines.append(
+                    f"{stem}{g_twig} {_prompt_title(no, text)}  "
+                    f"{len(items)} cp · +{added} −{removed}"
+                )
+                shown = [cp for _, cp in reversed(items)][:4]
+                hidden = len(items) - len(shown)
+                for ci, cp in enumerate(shown):
+                    twig = "└─" if ci == len(shown) - 1 and not hidden else "├─"
+                    lines.append(f"{g_stem}{twig} {cp_line(cp)}")
+                if hidden:
+                    lines.append(f"{g_stem}└─ … {hidden} more")
+            if hidden_groups:
+                lines.append(f"{stem}└─ … {hidden_groups} older prompt(s)")
         if pending:
             lines.append(f"└─ ✎ {pending} (pending)")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # /diff
+    # ------------------------------------------------------------------
+
+    @_command(
+        "diff",
+        "Show what a checkpoint (tN) or a whole prompt (pN) changed — latest checkpoint "
+        "by default; --patch adds the full diff.",
+        hint="[tN | pN] [--patch]",
+    )
+    def cmd_diff(args: str, ctx: Any) -> str | None:
+        if state is None or not state.enabled:
+            return f"✗ {_disabled_reason()}"
+        ckpts = state.checkpoints
+        if not ckpts:
+            return "• no checkpoints yet"
+        patch = any(t in ("--patch", "-p") for t in args.split())
+        hit = next((h for h in (_find_ref(t, ckpts) for t in args.split()) if h), None)
+        if hit is not None and hit[1] is None:
+            return f"✗ no {hit[0]} on {_short_branch(state.shadow_branch, state.session_id)}"
+        idx = hit[1] if hit is not None and hit[1] is not None else len(ckpts) - 1
+        if hit is not None and hit[0].startswith("p"):
+            kind, num = "p", int(ckpts[idx].get("prompt") or 0)
+            group = [c for c in ckpts if c.get("prompt") == num]
+        else:
+            kind, num = "t", int(ckpts[idx]["turn"])
+            group = [ckpts[idx]]
+        detail = ["--patch"] if patch else []
+        if kind == "t":
+            rc, out, err = _run_git(
+                "show", "--stat", *detail, "--format=%h %s%n%an · %ar", group[0]["hash"]
+            )
+            head = f"t{num} {group[0].get('tool', '')}".rstrip()
+            if group[0].get("prompt"):
+                head += (
+                    f" · {_prompt_title(int(group[0]['prompt']), group[0].get('prompt_text', ''))}"
+                )
+        else:
+            # One range over the prompt's checkpoints; shadow-meta commits in
+            # between only carry session files, which are excluded.
+            rc, out, err = _run_git(
+                "diff",
+                "--stat",
+                *detail,
+                f"{group[0]['hash']}^",
+                group[-1]["hash"],
+                "--",
+                ".",
+                ":(exclude).agent",
+            )
+            head = f"{_prompt_title(num, group[0].get('prompt_text', ''), 80)} · {len(group)} checkpoint(s)"
+        if rc != 0:
+            return f"✗ git failed: {err or '(no output)'}"
+        if kind == "p" and out and not out.startswith(" "):
+            out = " " + out  # _run_git strips; --stat lines are space-indented
+        return f"{head}\n{out}" if out else f"{head}\n(no changes)"
 
     # ------------------------------------------------------------------
     # /done
@@ -1612,6 +1861,49 @@ def register(api: Any) -> None:
                 },
             )
 
+        def _branch_children(
+            cps: list[dict[str, Any]], on_active: bool, branch: str, now: float
+        ) -> list[UINode]:
+            """Checkpoint nodes, grouped under prompt nodes when the branch's
+            checkpoints carry prompt info (newest first either way)."""
+            total = len(cps)
+            groups = _prompt_groups(cps)
+            if not groups:
+                return [_cp_node(c, i, total, on_active, now) for i, c in enumerate(cps)][::-1]
+            nodes: list[UINode] = []
+            for gi, (no, text, items) in enumerate(reversed(groups)):
+                first_idx = items[0][0]
+                added, removed = _group_stats(items)
+                has_tip = on_active and items[-1][0] == total - 1
+                nodes.append(
+                    _node(
+                        id=f"pr:{branch}:{no}",
+                        # Short enough for the sidebar at depth 2; the zoomed
+                        # window shows the longer excerpt in the detail.
+                        label=_prompt_title(no, text, 18) + (" ●" if has_tip else ""),
+                        detail=f"{len(items)} cp · +{added} −{removed}"
+                        + (f' · "{_prompt_excerpt(text, 60)}"' if len(text) > 18 else ""),
+                        kind="prompt",
+                        style="active" if has_tip else "",
+                        # The three newest prompts start open on the active branch.
+                        expanded=on_active and gi < 3,
+                        data={
+                            "prompt": no,
+                            "text": text,
+                            "checkpoints": len(items),
+                            "first": items[0][1]["hash"],
+                            "last": items[-1][1]["hash"],
+                            # Undo / retry drop this prompt and everything after it.
+                            "n_back": total - first_idx,
+                            "active_branch": on_active,
+                        },
+                        children=[
+                            _cp_node(cp, i, total, on_active, now) for i, cp in reversed(items)
+                        ],
+                    )
+                )
+            return nodes
+
         def _pending_summary() -> str:
             text = _pending_text(*_pending_counts())
             return f"{text} (pending)" if text else ""
@@ -1667,8 +1959,7 @@ def register(api: Any) -> None:
                 kind="branch",
                 style="active",
                 data={"name": st.shadow_branch, "active": True, "checkpoints": len(ckpts)},
-                # newest first
-                children=[_cp_node(c, i, len(ckpts), True, now) for i, c in enumerate(ckpts)][::-1],
+                children=_branch_children(ckpts, True, st.shadow_branch, now),
             )
             siblings: list[UINode] = []
             for b in _list_branches(f"shadow/session-{st.session_id}*"):
@@ -1683,9 +1974,7 @@ def register(api: Any) -> None:
                         kind="branch",
                         expanded=False,
                         data={"name": b, "active": False, "checkpoints": len(cps)},
-                        children=[_cp_node(c, i, len(cps), False, now) for i, c in enumerate(cps)][
-                            ::-1
-                        ],
+                        children=_branch_children(cps, False, b, now),
                     )
                 )
             base = _node(
@@ -1751,6 +2040,29 @@ def register(api: Any) -> None:
                 if len(node.children) > 15:
                     lines.append(f"… {len(node.children) - 15} older")
                 return "\n".join(lines)
+            if node.kind == "prompt":
+                no = int(node.data.get("prompt", 0))
+                lines = [_prompt_title(no, str(node.data.get("text", "")), _PROMPT_TEXT_MAX)]
+                rc, out, _ = _run_git(
+                    "diff",
+                    "--stat",
+                    f"{node.data.get('first')}^",
+                    str(node.data.get("last")),
+                    "--",
+                    ".",
+                    ":(exclude).agent",
+                )
+                if rc == 0 and out:
+                    lines += ["", out]
+                lines.append("")
+                for child in node.children:
+                    lines.append(f"{child.label}  {child.detail}".rstrip())
+                n_back = int(node.data.get("n_back", 0))
+                if not node.data.get("active_branch", True):
+                    lines += ["", "on a preserved branch — switch to it to undo or retry"]
+                else:
+                    lines += ["", f"undo prompt / retry drops {n_back} checkpoint(s)"]
+                return "\n".join(lines)
             if node.kind == "base":
                 rc, out, _ = _run_git("log", "-1", "--format=%h %s%n%an · %ar", st.original_branch)
                 head = out if rc == 0 else st.original_branch
@@ -1785,12 +2097,37 @@ def register(api: Any) -> None:
                 return "✗ switch to that branch first, then fork"
             return cmd_branch("", inv.ctx)
 
+        def _act_undo_prompt(inv: UIInvocation) -> str | None:
+            if not inv.node.data.get("active_branch", True):
+                return "✗ undo only applies to the active shadow branch — switch to it first"
+            n = int(inv.node.data.get("n_back", 0))
+            args = f"{n} --force" if inv.args.get("force") else str(n)
+            return _do_undo(args, inv.ctx)
+
+        def _act_retry_prompt(inv: UIInvocation) -> str | None:
+            if not inv.node.data.get("active_branch", True):
+                return "✗ fork from the active shadow branch — switch to it first"
+            return cmd_branch(str(int(inv.node.data.get("n_back", 0))), inv.ctx)
+
         def _act_switch(inv: UIInvocation) -> str | None:
             if inv.node.data.get("active"):
                 return "• already on this branch"
             return cmd_switch(str(inv.node.data.get("name", "")), inv.ctx)
 
         def _act_diff(inv: UIInvocation) -> str | None:
+            if inv.node.kind == "prompt":
+                rc, out, err = _run_git(
+                    "diff",
+                    "--stat",
+                    f"{inv.node.data.get('first')}^",
+                    str(inv.node.data.get("last")),
+                    "--",
+                    ".",
+                    ":(exclude).agent",
+                )
+                if rc != 0:
+                    return f"✗ git diff failed: {err or '(no output)'}"
+                return f"{inv.node.label}\n{out}" if out else "(no changes)"
             sha = str(inv.node.data.get("hash", ""))
             rc, out, err = _run_git("show", "--stat", "--format=%h %s", sha)
             if rc != 0:
@@ -1856,7 +2193,21 @@ def register(api: Any) -> None:
                 ),
                 UIAction("branch", "fork here", "b", ("checkpoint", "branch"), _act_branch),
                 UIAction("switch", "switch", "s", ("branch",), _act_switch),
-                UIAction("diff", "diff", "d", ("checkpoint",), _act_diff, mutates=False),
+                UIAction(
+                    "undo_prompt",
+                    "undo prompt",
+                    "u",
+                    ("prompt",),
+                    _act_undo_prompt,
+                    destructive=True,
+                    confirm=(
+                        "Revert {label} and everything after it?\n"
+                        "Dropped checkpoints stay reachable in git reflog."
+                    ),
+                    inputs=("force",),
+                ),
+                UIAction("retry_prompt", "retry from before", "b", ("prompt",), _act_retry_prompt),
+                UIAction("diff", "diff", "d", ("checkpoint", "prompt"), _act_diff, mutates=False),
                 UIAction(
                     "delete",
                     "delete",
@@ -1883,7 +2234,7 @@ def register(api: Any) -> None:
                     "refresh",
                     "refresh",
                     "r",
-                    ("root", "base", "branch", "checkpoint", "info"),
+                    ("root", "base", "branch", "prompt", "checkpoint", "info"),
                     _act_refresh,
                     mutates=False,
                 ),

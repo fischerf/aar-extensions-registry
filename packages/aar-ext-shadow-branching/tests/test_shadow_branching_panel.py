@@ -88,6 +88,8 @@ def test_panel_registered_with_expected_actions(session_api) -> None:
         "delete",
         "done",
         "refresh",
+        "undo_prompt",
+        "retry_prompt",
     }
     undo = panel.action("undo")
     assert undo is not None and undo.destructive and "force" in undo.inputs
@@ -495,7 +497,7 @@ def test_checkpoint_note_attached_to_tool_result(session_api) -> None:
     for handler in api.handlers["tool_result"]:
         handler(tr, ctx)
     sha = _session_state(ctx)["checkpoints"][-1]["hash"]
-    assert tool_result_notes(tr) == [f"⎇ checkpoint t1 · {sha} · 1 file +2 −0"]
+    assert tool_result_notes(tr) == [f"⎇ checkpoint t1 · {sha} · 1 file +2 −0 · /undo t1"]
 
     # No changes → no checkpoint → no note.
     tr2 = ToolResult(tool_name="read_file", output="ok")
@@ -508,7 +510,7 @@ def test_checkpoint_note_attached_to_tool_result(session_api) -> None:
     tr3 = ToolResult(tool_name="write_file", output="ok")
     for handler in api.handlers["tool_result"]:
         handler(tr3, ctx)
-    assert tool_result_notes(tr3)[0].endswith("· ⚠ sensitive path")
+    assert tool_result_notes(tr3)[0].endswith("· ⚠ sensitive path · /undo t2")
 
 
 def test_commands_declare_argument_hints(repo) -> None:
@@ -518,9 +520,10 @@ def test_commands_declare_argument_hints(repo) -> None:
     api = ExtensionAPI("shadow_branching")
     register(api)
     assert api._command_hints == {
-        "undo": "[N] [--force]",
-        "revert": "[N] [--force]",
-        "branch": "[N]",
+        "undo": "[N | tN | pN] [--force]",
+        "revert": "[N | tN | pN] [--force]",
+        "branch": "[N | tN | pN]",
+        "diff": "[tN | pN] [--patch]",
         "switch": "[main | K | branch-K]",
         "done": "[message] [--yes]",
     }
