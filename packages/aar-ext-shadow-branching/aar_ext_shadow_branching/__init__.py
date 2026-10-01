@@ -396,6 +396,34 @@ def _shortstat(*revs: str, cwd: str | Path | None = None) -> str:
     )
 
 
+_LABEL_MAX = 40
+# Lines of patch shown in the zoomed panel's detail pane for a checkpoint.
+_DESCRIBE_PATCH_LINES = 300
+
+
+def _clean_label(text: str) -> str:
+    """A branch name as typed by the user: quotes stripped, whitespace
+    collapsed, capped at ``_LABEL_MAX`` characters."""
+    label = " ".join(text.replace('"', " ").replace("'", " ").split())
+    return label[:_LABEL_MAX]
+
+
+def _branch_label(branch: str, cwd: str | Path | None = None) -> str:
+    """User-given name of *branch* (``git config branch.<b>.description``).
+
+    Stored in git config so it follows ``git branch -m`` and disappears with
+    ``git branch -D``."""
+    rc, out, _ = _run_git("config", "--get", f"branch.{branch}.description", cwd=cwd)
+    return out.splitlines()[0].strip() if rc == 0 and out else ""
+
+
+def _set_branch_label(branch: str, label: str, cwd: str | Path | None = None) -> bool:
+    if label:
+        return _run_git("config", f"branch.{branch}.description", label, cwd=cwd)[0] == 0
+    _run_git("config", "--unset", f"branch.{branch}.description", cwd=cwd)
+    return True
+
+
 def _short_branch(branch: str, session_id: str) -> str:
     """``shadow`` for the canonical branch, ``branch-1`` (or
     ``branch-1-branch-2``) for preserved copies — the full ref name is too
@@ -901,6 +929,33 @@ def register(api: Any) -> None:
             return len(ckpts) - idx, flags, label, ""
         n, flags = _parse_int_arg(args)
         return n, flags, "", ""
+
+    def _resolve_branch(target: str) -> str:
+        """Map a /switch-style target to a branch name: ``main`` / ``active`` /
+        ``shadow`` → canonical, ``K`` / ``branch-K`` → preserved copy K, a full
+        ``shadow/session-…`` name as is, otherwise a branch *name* given with
+        ``/branch … <name>`` or ``/label``, falling back to ``<canonical>-<target>``."""
+        assert state is not None
+        canonical = f"shadow/session-{state.session_id}"
+        if target in {"main", "active", "shadow"}:
+            return canonical
+        if target.isdigit():
+            return f"{canonical}-branch-{target}"
+        if target.startswith("branch-"):
+            return f"{canonical}-{target}"
+        if target.startswith("shadow/session-"):
+            return target
+        wanted = _clean_label(target).lower()
+        for b in _list_branches(f"shadow/session-{state.session_id}*"):
+            if wanted and _branch_label(b).lower() == wanted:
+                return b
+        return f"{canonical}-{target}"
+
+    def _display_branch(branch: str) -> str:
+        """Short name for trees: the user's name if set, else ``shadow`` /
+        ``branch-K``."""
+        assert state is not None
+        return _branch_label(branch) or _short_branch(branch, state.session_id)
 
     def _find_ref(tok: str, ckpts: list[dict[str, Any]]) -> tuple[str, int | None] | None:
         """Resolve one argument token naming a checkpoint or prompt.
@@ -1520,9 +1575,9 @@ def register(api: Any) -> None:
 
     @_command(
         "branch",
-        "Preserve current shadow as shadow/session-<id>-branch-<K> and start a fresh branch "
-        "(optionally from N back, or from before tN / pN).",
-        hint="[N | tN | pN]",
+        "Preserve current shadow as shadow/session-<id>-branch-<K> (optionally named) and "
+        "start a fresh branch (optionally from N back, or from before tN / pN).",
+        hint="[N | tN | pN] [name]",
     )
     def cmd_branch(args: str, ctx: Any) -> str | None:
         nonlocal state
@@ -1562,6 +1617,17 @@ def register(api: Any) -> None:
         n, _, _ref, error = _resolve_back(args)
         if error:
             return error
+        # Anything that is neither a count, a reference nor a flag names the
+        # preserved copy ("/branch p2 sqlite-attempt").
+        name = _clean_label(
+            " ".join(
+                t
+                for t in args.split()
+                if not t.startswith("-")
+                and not t.isdigit()
+                and _find_ref(t, state.checkpoints) is None
+            )
+        )
         if n is not None and n > len(state.checkpoints):
             ctx.logger.warning(
                 "shadow-branching: only %d checkpoints, cannot branch %d back",
@@ -1611,6 +1677,8 @@ def register(api: Any) -> None:
             return f"✗ cannot start new branch at {branch_sha[:8]}: {err}"
 
         state.branch_counter = branch_n
+        if name:
+            _set_branch_label(preserved, name)
         if n:
             state.checkpoints = state.checkpoints[:-n]
             state.turn_counter = max(0, state.turn_counter - n)
@@ -1646,7 +1714,11 @@ def register(api: Any) -> None:
         state.redo_stack.clear()
         _sync_metadata(ctx)
         suffix = f" (rewound {n} checkpoint(s))" if n else ""
-        return f"⑂ branch-{branch_n} preserved as {preserved}{suffix} — now on fresh {state.shadow_branch}"
+        named = f' "{name}"' if name else ""
+        return (
+            f"⑂ branch-{branch_n}{named} preserved as {preserved}{suffix} — "
+            f"now on fresh {state.shadow_branch}"
+        )
 
     # ------------------------------------------------------------------
     # /switch
@@ -1686,18 +1758,8 @@ def register(api: Any) -> None:
         # Sweep up session-store writes before checking for a clean tree.
         _auto_commit_pending(ctx, "pre-switch sync")
 
-        # Canonical shadow branch shorthands
-        canonical = f"shadow/session-{state.session_id}"
-        if target in {"main", "active", "shadow"}:
-            target = canonical
-
-        # Numeric / branch-K / other shorthands → shadow/session-<id>-branch-K
-        elif target.isdigit():
-            target = f"{canonical}-branch-{target}"
-        elif target.startswith("branch-"):
-            target = f"{canonical}-{target}"
-        elif not target.startswith("shadow/session-"):
-            target = f"{canonical}-{target}"
+        # Shorthands (main / K / branch-K) and branch names → full branch name
+        target = _resolve_branch(target)
 
         # ── Guard: never switch to a branch belonging to a different session ──
         if target.startswith("shadow/session-") and not _branch_belongs_to_session(
@@ -1807,7 +1869,9 @@ def register(api: Any) -> None:
             stem = "   " if last_branch else "│  "
             marker = "  ◀ active" if active else ""
             dot = "●" if active else "○"
-            lines.append(f"{head} {dot} {b}  ({len(cps)} cp){marker}")
+            label = _branch_label(b)
+            named = f' "{label}"' if label else ""
+            lines.append(f"{head} {dot} {b}{named}  ({len(cps)} cp){marker}")
             ctx.logger.info("  * %s%s", b, " (active)" if active else "")
             tool_w = max((len(str(c.get("tool", ""))) for c in cps), default=0)
             tip_hash = cps[-1]["hash"] if active and cps else ""
@@ -1857,6 +1921,86 @@ def register(api: Any) -> None:
                 lines.append(f"{stem}└─ … {hidden_groups} older prompt(s)")
         if pending:
             lines.append(f"└─ ✎ {pending} (pending)")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # /label
+    # ------------------------------------------------------------------
+
+    @_command(
+        "label",
+        "Name the active line (shown in trees, accepted by /switch and /compare); "
+        "no text clears it.",
+        hint="[name]",
+    )
+    def cmd_label(args: str, ctx: Any) -> str | None:
+        if state is None or not state.enabled:
+            return f"✗ {_disabled_reason()}"
+        name = _clean_label(args)
+        _set_branch_label(state.shadow_branch, name)
+        _sync_metadata(ctx)  # wakes the panel
+        if not name:
+            return f"✎ cleared the name of {state.shadow_branch}"
+        return f'✎ {state.shadow_branch} is now "{name}"'
+
+    # ------------------------------------------------------------------
+    # /compare
+    # ------------------------------------------------------------------
+
+    @_command(
+        "compare",
+        "Compare the active line with another branch of this session: fork point, "
+        "prompts only on each side, and the diff between them (--patch for the full diff).",
+        hint="<main | K | branch-K | name> [--patch]",
+    )
+    def cmd_compare(args: str, ctx: Any) -> str | None:
+        if state is None or not state.enabled:
+            return f"✗ {_disabled_reason()}"
+        tokens = [t for t in args.split() if not t.startswith("-")]
+        patch = any(t in ("--patch", "-p") for t in args.split())
+        if not tokens:
+            return "✗ usage: /compare <main | K | branch-K | name> [--patch]"
+        other = _resolve_branch(" ".join(tokens))
+        if not _branch_belongs_to_session(other, state.session_id) or not _branch_exists(other):
+            return f"✗ no branch {' '.join(tokens)!r} in this session — see /branches"
+        if other == state.shadow_branch:
+            return "• that is the active line — nothing to compare"
+
+        mine = list(state.checkpoints)
+        theirs = _checkpoints_of(other)
+        _, fork, _ = _run_git("merge-base", state.shadow_branch, other)
+        mine_hashes = {c["hash"] for c in mine}
+        their_hashes = {c["hash"] for c in theirs}
+
+        def side(cps: list[dict[str, Any]], exclude: set[str]) -> list[str]:
+            only = [c for c in cps if c["hash"] not in exclude]
+            groups = _prompt_groups(only)
+            if not groups:
+                return [f"t{c['turn']} {c['tool']}" for c in only] or ["(nothing)"]
+            out = []
+            for no, text, items in groups:
+                added, removed = _group_stats(items)
+                out.append(f"{_prompt_title(no, text)}  {len(items)} cp · +{added} −{removed}")
+            return out
+
+        a, b = _display_branch(state.shadow_branch), _display_branch(other)
+        lines = [f"⇄ {a} ({len(mine)} cp, active) vs {b} ({len(theirs)} cp)"]
+        if fork:
+            lines.append(f"  forked at {fork[:7]}")
+        lines.append(f"only on {a}:")
+        lines += [f"  {ln}" for ln in side(mine, their_hashes)]
+        lines.append(f"only on {b}:")
+        lines += [f"  {ln}" for ln in side(theirs, mine_hashes)]
+        detail = ["--patch"] if patch else []
+        rc, out, _ = _run_git(
+            "diff", "--stat", *detail, state.shadow_branch, other, "--", ".", ":(exclude).agent"
+        )
+        lines.append(f"{a} → {b}:")
+        if rc == 0 and out:
+            lines.append(out if out.startswith(" ") else " " + out)
+        else:
+            lines.append("  (same files)")
+        lines.append(f"keep {b}: /switch {b} · drop it: delete it in the panel or with git")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1923,7 +2067,7 @@ def register(api: Any) -> None:
     @_command(
         "done",
         "Squash-merge the active shadow branch into its recorded base; aborts on conflicts.",
-        hint="[message] [--yes] [--dry-run]",
+        hint="[message] [--yes] [--cleanup] [--dry-run]",
     )
     def cmd_done(args: str, ctx: Any) -> str | None:
         if state is None or not state.enabled:
@@ -2034,7 +2178,18 @@ def register(api: Any) -> None:
         state.mode = "done"
         state.redo_stack.clear()
         _sync_metadata(ctx)  # pops the stale _active_states entry
-        return f"✓ squashed {state.shadow_branch} → {base} as {sha}"
+        cleaned = ""
+        if "--cleanup" in flags:
+            # HEAD is on the base now, so every shadow branch can go.
+            deleted = [
+                b
+                for b in _list_branches(f"shadow/session-{state.session_id}*")
+                if _branch_belongs_to_session(b, state.session_id)
+                and _run_git("branch", "-D", b)[0] == 0
+            ]
+            _branch_ckpt_cache.clear()
+            cleaned = f" · deleted {len(deleted)} shadow branch(es)"
+        return f"✓ squashed {state.shadow_branch} → {base} as {sha}{cleaned}"
 
     # ------------------------------------------------------------------
     # UI panel — base → shadow branch → checkpoints, sibling branches,
@@ -2175,7 +2330,7 @@ def register(api: Any) -> None:
 
             now = time.time()
             ckpts = st.checkpoints
-            active_short = _short_branch(st.shadow_branch, st.session_id)
+            active_short = _display_branch(st.shadow_branch)
             active = _node(
                 id=f"br:{st.shadow_branch}",
                 label=f"{active_short} ● active",
@@ -2193,7 +2348,7 @@ def register(api: Any) -> None:
                 siblings.append(
                     _node(
                         id=f"br:{b}",
-                        label=f"{_short_branch(b, st.session_id)} ({len(cps)} cp)",
+                        label=f"{_display_branch(b)} ({len(cps)} cp)",
                         detail=b,
                         kind="branch",
                         expanded=False,
@@ -2247,6 +2402,18 @@ def register(api: Any) -> None:
                     lines.append(f"undo to here drops the {n_back} newer checkpoint(s)")
                 else:
                     lines.append("tip of the active shadow branch")
+                # The patch itself (coloured by the TUI), capped for huge commits.
+                rc, patch, _ = _run_git(
+                    "show", "--format=", "--patch", sha, "--", ".", ":(exclude).agent"
+                )
+                if rc == 0 and patch:
+                    patch_lines = patch.splitlines()
+                    lines += ["", *patch_lines[:_DESCRIBE_PATCH_LINES]]
+                    if len(patch_lines) > _DESCRIBE_PATCH_LINES:
+                        more = len(patch_lines) - _DESCRIBE_PATCH_LINES
+                        lines.append(
+                            f"… {more} more line(s) — /diff t{node.data.get('turn')} --patch"
+                        )
                 return "\n".join(lines)
             if node.kind == "branch":
                 name = str(node.data.get("name", ""))
@@ -2422,7 +2589,7 @@ def register(api: Any) -> None:
             if st is None or not st.enabled:
                 return ""
             # Short: it heads the narrow sidebar and sits in the header chip.
-            return f"⎇ {_short_branch(st.shadow_branch, st.session_id)} · {len(st.checkpoints)} cp"
+            return f"⎇ {_display_branch(st.shadow_branch)} · {len(st.checkpoints)} cp"
 
         panel_kwargs: dict[str, Any] = {"describe": _describe} if _PANEL_HAS_DESCRIBE else {}
         panel = UIPanel(

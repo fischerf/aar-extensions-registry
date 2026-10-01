@@ -524,9 +524,11 @@ def test_commands_declare_argument_hints(repo) -> None:
         "revert": "[N | tN | pN] [--force] [--dry-run]",
         "redo": "[--force]",
         "restore": "<path> [tN | pN | sha] [--force]",
-        "branch": "[N | tN | pN]",
+        "branch": "[N | tN | pN] [name]",
+        "label": "[name]",
+        "compare": "<main | K | branch-K | name> [--patch]",
         "diff": "[tN | pN] [--patch]",
         "switch": "[main | K | branch-K]",
-        "done": "[message] [--yes] [--dry-run]",
+        "done": "[message] [--yes] [--cleanup] [--dry-run]",
     }
     assert "branches" in api._commands
