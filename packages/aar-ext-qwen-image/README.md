@@ -527,6 +527,15 @@ Python 3.14 has no torch wheels either.
 
 ## Quantized transformer (GGUF)
 
+> **The files below were removed upstream (September 2026).**
+> `abenzerps/Qwen-Image-2.1-GGUF` now redirects to `abenzerps/Qwen-Image-2.1-Uncensored-GGUF`,
+> which only carries `qwen-image-2.1-UC-*.gguf` — *different* weights (none of the SHA-256
+> sums match; the repo's own `SHA256SUMS` still lists the originals). A copy already in
+> your Hugging Face cache keeps working: the server falls back to it when the download
+> fails. On a fresh machine, `quant` cannot fetch these names any more — set `quant_file`
+> to a `.gguf` you have. Switching to the `UC-` files is a content decision, so the
+> extension does not do it for you.
+
 `quant` loads the transformer from a GGUF quantization of the *same* Qwen-Image-2.1
 weights instead of the published bf16 tensors. Only the transformer is quantized —
 the text encoder and VAE are unchanged, and still come from `Qwen/Qwen-Image-2.1`.

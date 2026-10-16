@@ -879,6 +879,9 @@ def register(
             "height": h,
             "steps": steps or cfg.steps,
             "seed": seed,
+            # tells the server whether to keep the alpha channel: the model returns RGBA
+            # for every render, and an opaque photo comes back partly see-through
+            "transparent": transparent,
             "options": {"true_cfg_scale": cfg.true_cfg_scale},
         }
 

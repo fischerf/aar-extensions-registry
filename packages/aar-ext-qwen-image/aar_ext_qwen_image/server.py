@@ -316,7 +316,43 @@ def resolve_gguf_path(settings: ModelSettings) -> str:
     from huggingface_hub import hf_hub_download
 
     logger.info("resolving %s from %s", filename, settings.quant_repo)
-    return hf_hub_download(settings.quant_repo, filename)
+    try:
+        return hf_hub_download(settings.quant_repo, filename)
+    except Exception as exc:
+        # Upstream removed or renamed the file (abenzerps/Qwen-Image-2.1-GGUF did both),
+        # or we are offline.  A copy already downloaded is still the same weights.
+        cached = cached_hub_file(settings.quant_repo, filename)
+        if cached:
+            logger.warning(
+                "%s is not downloadable from %s (%s: %s) — using the cached copy %s",
+                filename, settings.quant_repo, type(exc).__name__, exc, cached,
+            )  # fmt: skip
+            return cached
+        raise RuntimeError(
+            f"{filename} could not be fetched from {settings.quant_repo} and is not in the "
+            f"local Hugging Face cache ({type(exc).__name__}: {exc}). The repo may have "
+            "removed or renamed it — download a .gguf yourself and point quant_file at it"
+        ) from exc
+
+
+def cached_hub_file(repo_id: str, filename: str) -> str | None:
+    """Path of *filename* in any cached snapshot of *repo_id*, or ``None``.
+
+    ``hf_hub_download(local_files_only=True)`` only looks in the snapshot that
+    ``refs/main`` points to — and after upstream moves ``main`` on (a rename, a
+    deleted file), that is a snapshot the file was never downloaded into.
+    ``scan_cache_dir`` is no help either: it skips a repo whose ref points at a
+    snapshot that was never fetched.  So walk the documented cache layout.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception:
+        return None
+    snapshots = Path(HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}" / "snapshots"
+    hits = [p for p in snapshots.glob(f"*/{filename}") if p.is_file()]
+    if not hits:
+        return None
+    return str(max(hits, key=lambda p: p.stat().st_mtime))
 
 
 def ensure_single_file_loadable(diffusers_mod: Any, cls: Any) -> bool:
@@ -382,6 +418,19 @@ def decode_image(data: str) -> Any:
         return Image.open(io.BytesIO(raw)).convert("RGB")
     except UnidentifiedImageError as exc:
         raise ValueError(f"unreadable image: {exc}") from exc
+
+
+def drop_unrequested_alpha(image: Any, transparent: bool | None) -> Any:
+    """Return RGB when the caller explicitly did not ask for transparency.
+
+    Qwen-Image-2.1 decodes to RGBA for every render, and the alpha of an opaque
+    one is not a clean 255: measured 214..255 (22% of pixels below 255) on an
+    SDNQ int4 photo, 250..255 (3-4%) on bf16 / GGUF — a photo that is faintly
+    see-through wherever it lands.  ``None`` keeps the old behaviour.
+    """
+    if transparent is False and getattr(image, "mode", None) == "RGBA":
+        return image.convert("RGB")
+    return image
 
 
 def encode_image(image: Any) -> str:
@@ -636,15 +685,44 @@ class QwenImageBackend:
             try:
                 import torch
 
-                used = torch.cuda.memory_allocated(torch.device(self.device)) / 2**30
-                name = torch.cuda.get_device_name(torch.device(self.device))
-                return f"{self.device} ({name}), {used:.2f} GB allocated"
+                dev = torch.device(self.device)
+                used = torch.cuda.memory_allocated(dev) / 2**30
+                # reserved = live tensors + the caching allocator's pool; it is what
+                # the card (and anything sharing it, e.g. Ollama) actually loses
+                held = torch.cuda.memory_reserved(dev) / 2**30
+                name = torch.cuda.get_device_name(dev)
+                return f"{self.device} ({name}), {used:.2f} GB allocated, {held:.2f} GB reserved"
             except Exception:
                 pass
         for entry in self.devices:
             if entry["device"] == self.device:
                 return f"{self.device} ({entry['name']})"
         return self.device
+
+    def _release_cache(self) -> None:
+        """Hand the render's activation memory back to the driver.
+
+        PyTorch's caching allocator keeps every block it ever used, so an idle
+        server otherwise sits on the peak of its last render until it exits —
+        VRAM a chat model sharing the card needs to reload into.  Weights meant to
+        stay resident (``offload: "none"``) are live tensors and are not affected.
+
+        This cannot release the GPU runtime itself: on ROCm/Windows an idle
+        server still holds ~3.6 GB (HIP context, loaded kernels) with only
+        0.15 GB reserved by torch.  Only exiting the process (``idle_timeout``,
+        ``/qwenimage stop``) returns that.
+        """
+        if not self.device.startswith("cuda"):
+            return
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.warning("releasing the CUDA cache failed", exc_info=True)
 
     def health(self) -> dict[str, Any]:
         s = self.settings
@@ -726,11 +804,15 @@ class QwenImageBackend:
 
         t0 = time.monotonic()
         with self._lock:
-            image = pipe(**accepted).images[0]
+            try:
+                image = pipe(**accepted).images[0]
+            finally:
+                self._release_cache()
+        image = drop_unrequested_alpha(image, req.get("transparent"))
         seconds = round(time.monotonic() - t0, 1)
         logger.info(
-            "rendered %dx%d in %.1fs (%d refs, seed %d)",
-            image.width, image.height, seconds, len(refs), seed,
+            "rendered %dx%d in %.1fs (%d refs, seed %d) — %s",
+            image.width, image.height, seconds, len(refs), seed, self._vram(),
         )  # fmt: skip
         return {
             "images": [encode_image(image)],
@@ -755,6 +837,8 @@ class RenderRequest(BaseModel):
     height: int = Field(default=1024, ge=64, le=4096)
     steps: int = Field(default=30, ge=1, le=200)
     seed: int | None = None
+    # None = an older client that does not say; keep whatever the pipeline returned
+    transparent: bool | None = None
     images: list[str] = Field(default_factory=list)
     options: dict[str, Any] = Field(default_factory=dict)
 
