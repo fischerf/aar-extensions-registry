@@ -7,6 +7,7 @@ heavy ML stack.
 
     python server.py --port 8770 --device auto --offload model
     python server.py --port 8770 --quant Q4_K_M       # GGUF transformer
+    python server.py --port 8770 --resident transformer,vae   # pin, don't offload
     python server.py --list-devices                   # what torch sees, then exit
 
 ``--quant`` loads the transformer from a GGUF quantization instead of the base
@@ -36,6 +37,12 @@ server exits on its own after ``--idle-timeout`` seconds without a request.
 Renders are serialised behind one lock: a single diffusion pipeline cannot run
 two prompts at once, and on an offloaded GPU a second one would thrash.
 
+``--offload model`` keeps the weights in system RAM and moves each component onto
+the card as the pipeline reaches it, so VRAM reads near-zero between renders.
+``--resident`` pins named components instead, which matters when the bus is slow
+(an eGPU over Thunderbolt) — but only on a card with headroom: whatever stays
+resident is memory the activations no longer have. See ``_pin_resident``.
+
 Unknown pipeline options (``true_cfg_scale``, ``output_resolution``, …) are filtered
 against the installed pipeline's real signature and reported back in
 ``ignored`` rather than raising — diffusers' Qwen-Image support moves quickly,
@@ -48,6 +55,7 @@ import argparse
 import base64
 import binascii
 import inspect
+import json
 import io
 import logging
 import os
@@ -78,6 +86,12 @@ EDIT_PIPELINE_CANDIDATES = (
     "QwenImageImg2ImgPipeline",
 )
 DTYPES = ("bfloat16", "float16", "float32")
+# A graceful uvicorn shutdown waits for in-flight requests.  A render holds the
+# pipeline lock for minutes and can wedge outright, and until the process exits
+# it keeps the weights on the GPU — so `/shutdown` escalates to a hard exit
+# after this many seconds rather than leaving an orphan holding the card.
+SHUTDOWN_GRACE_S = 20.0
+
 MAX_SEED = 2**31 - 1
 
 # Kept in step with GGUF_QUANTS in __init__.py by hand: this file is standalone
@@ -115,6 +129,19 @@ class ModelSettings:
     quant: str = "none"  # "none" or one of GGUF_QUANTS
     quant_repo: str = GGUF_REPO
     quant_file: str | None = None  # local .gguf path, or a file name inside quant_repo
+    # Memory savers that trade a little speed for a much lower activation peak.
+    # They matter most with ``offload="none"``: the weights then occupy most of
+    # the card, and it is the per-step activations that decide whether a larger
+    # image fits or spills into host memory.
+    vae_tiling: bool = False
+    vae_slicing: bool = False
+    attention_slicing: bool = False
+    # Pipeline components pinned to the GPU while the rest stay CPU-offloaded.
+    # The point is that components are not used equally: the transformer runs
+    # once per denoising step, the text encoder once per *render*. On a slow bus
+    # (an eGPU over Thunderbolt) pinning the hot components and letting the cold
+    # ones travel costs a fraction of moving the whole pipeline every time.
+    resident: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +239,45 @@ def torch_device(device: str) -> Any:
         _, _, index = device.partition(":")
         return torch_directml.device(int(index or 0))
     return device
+
+
+def _register_quant_backends() -> None:
+    """Import optional quantization backends so diffusers can load their weights.
+
+    Checkpoints quantized with SDNQ (SD.Next Quantization) are ordinary diffusers
+    pipelines whose weights only deserialize once ``sdnq`` has registered itself,
+    so the import has to happen *before* ``from_pretrained``.  It is a no-op for
+    every other checkpoint, and simply absent on installs that do not need it.
+
+    This is what makes an int4 pipeline — text encoder included — loadable:
+    GGUF quantization only covers the transformer, leaving a ~15 GB bf16 text
+    encoder that dominates the memory budget.
+    """
+    try:
+        import sdnq  # noqa: F401
+    except ImportError:
+        logger.debug("sdnq not installed; SDNQ-quantized checkpoints will not load")
+        return
+    logger.info("sdnq %s registered", getattr(sdnq, "__version__", "?"))
+
+
+def _resolve_attr(obj: Any, dotted: str) -> Any:
+    """Look up a dotted attribute path, returning None if any hop is missing."""
+    current = obj
+    for part in dotted.split("."):
+        current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current
+
+
+def _is_module(component: Any) -> bool:
+    """True for pipeline entries that are actual weights (not tokenizers/schedulers)."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is always present in the venv
+        return False
+    return isinstance(component, torch.nn.Module)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +408,7 @@ class QwenImageBackend:
     _pipe: Any = None
     _edit_pipe: Any = None
     _placed: Any = None  # pipeline the offload hooks are currently installed on
+    resident_applied: tuple[str, ...] = ()  # of ``settings.resident``, what the pipeline had
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def load(self) -> None:
@@ -361,6 +428,7 @@ class QwenImageBackend:
         import torch
 
         s = self.settings
+        _register_quant_backends()
         if s.dtype not in DTYPES:
             raise ValueError(f"dtype must be one of {', '.join(DTYPES)}, got {s.dtype!r}")
         self.devices = available_devices()
@@ -468,13 +536,100 @@ class QwenImageBackend:
         offload = self.settings.offload
         device = torch_device(self.device)
         if offload == "sequential":
+            self._pin_resident(pipe)
             pipe.enable_sequential_cpu_offload(device=device)
         elif offload == "model":
+            self._pin_resident(pipe)
             pipe.enable_model_cpu_offload(device=device)
         elif offload == "none":
             pipe.to(device)
         else:
             raise ValueError(f"offload must be none, model or sequential, got {offload!r}")
+
+        self._apply_memory_savers(pipe)
+
+    def _pin_resident(self, pipe: Any) -> None:
+        """Exclude the configured components from CPU offloading.
+
+        Two things are needed, and only doing the first is a silent no-op:
+
+        * ``_exclude_from_cpu_offload`` names components that should be moved to
+          the device once and left there.  But diffusers only consults it for
+          components *outside* ``model_cpu_offload_seq`` — everything in the
+          chain is hooked unconditionally.
+        * So the pinned names must also be removed from ``model_cpu_offload_seq``.
+          They then fall through to the branch that honours the exclusion list.
+
+        Unknown names are dropped with a warning rather than raising — component
+        names differ between pipeline classes, and a stale config entry should
+        not stop the server from starting.
+        """
+        wanted = [c.strip() for c in self.settings.resident if c.strip()]
+        if not wanted:
+            return
+
+        available = {
+            name
+            for name, component in getattr(pipe, "components", {}).items()
+            if _is_module(component)
+        }
+        unknown = [name for name in wanted if name not in available]
+        if unknown:
+            logger.warning(
+                "resident component(s) %s not on this pipeline; known: %s",
+                ", ".join(unknown),
+                ", ".join(sorted(available)) or "(none)",
+            )
+        keep = [name for name in wanted if name in available]
+        self.resident_applied = tuple(keep)
+        if not keep:
+            return
+
+        pipe._exclude_from_cpu_offload = list(keep)
+
+        seq = getattr(pipe, "model_cpu_offload_seq", None)
+        if seq:
+            remaining = [name for name in seq.split("->") if name not in keep]
+            pipe.model_cpu_offload_seq = "->".join(remaining)
+            logger.debug("offload chain %r -> %r", seq, pipe.model_cpu_offload_seq)
+        logger.info("pinned to %s: %s", self.device, ", ".join(keep))
+
+    def _apply_memory_savers(self, pipe: Any) -> None:
+        """Enable the configured activation-memory reducers.
+
+        Each is best-effort: diffusers' Qwen-Image pipelines have gained and lost
+        these helpers between releases, and a missing one should degrade to "not
+        enabled" rather than refuse to start the server.
+        """
+        s = self.settings
+        # Each saver has two spellings: the pipeline-level helper, and the one on
+        # the VAE itself. Qwen-Image pipelines ship the second but not always the
+        # first, so trying only ``pipe.enable_vae_tiling()`` reports "unavailable"
+        # for something the model card actively recommends.
+        wanted = (
+            ("vae_tiling", s.vae_tiling, ("enable_vae_tiling", "vae.enable_tiling")),
+            ("vae_slicing", s.vae_slicing, ("enable_vae_slicing", "vae.enable_slicing")),
+            ("attention_slicing", s.attention_slicing, ("enable_attention_slicing",)),
+        )
+        for label, enabled, candidates in wanted:
+            if not enabled:
+                continue
+            for path in candidates:
+                fn = _resolve_attr(pipe, path)
+                if fn is None:
+                    continue
+                try:
+                    fn()
+                    logger.info("%s enabled via %s()", label, path)
+                    break
+                except Exception:
+                    logger.warning("%s: %s() failed", label, path, exc_info=True)
+            else:
+                logger.warning(
+                    "%s requested but none of %s are available on this pipeline",
+                    label,
+                    ", ".join(f"{c}()" for c in candidates),
+                )
 
     def _vram(self) -> str:
         if self.device.startswith("cuda"):
@@ -502,6 +657,11 @@ class QwenImageBackend:
             "transformer": self.transformer_name,
             "dtype": s.dtype,
             "offload": s.offload,
+            "vae_tiling": s.vae_tiling,
+            "vae_slicing": s.vae_slicing,
+            "attention_slicing": s.attention_slicing,
+            "resident": list(s.resident),
+            "resident_applied": list(self.resident_applied),
             # quant_file alone (no --quant) still means a quantized transformer
             "quant": s.quant if s.quant != "none" else ("custom" if self.quant_path else "none"),
             "quant_file": self.quant_path,
@@ -519,6 +679,15 @@ class QwenImageBackend:
         # no generator of its own, so a CPU generator is the portable choice.
         on_device = self.settings.offload == "none" and self.device.startswith("cuda")
         return torch.Generator(device=self.device if on_device else "cpu").manual_seed(seed)
+
+    @property
+    def busy(self) -> bool:
+        """True while a render holds the pipeline lock.
+
+        Used by ``/shutdown``: a graceful exit has to wait for the in-flight
+        render, which on an offloaded GPU is minutes away at best.
+        """
+        return self._lock.locked()
 
     def render(self, req: dict[str, Any]) -> dict[str, Any]:
         """Run one generate (no ``images``) or edit (with ``images``) request."""
@@ -652,11 +821,14 @@ def create_app(
         return _render(req, editing=True)
 
     @app.post("/shutdown")
-    def shutdown() -> dict[str, str]:
-        logger.info("shutdown requested via /shutdown")
+    def shutdown() -> dict[str, Any]:
+        busy = bool(getattr(backend, "busy", False))
+        logger.info("shutdown requested via /shutdown (busy=%s)", busy)
         if on_shutdown is not None:
             on_shutdown()
-        return {"status": "stopping"}
+        # A render in flight means uvicorn's graceful shutdown cannot complete
+        # until it does, so the caller is told the process will be killed.
+        return {"status": "stopping", "busy": busy, "force_after": SHUTDOWN_GRACE_S}
 
     return app
 
@@ -689,6 +861,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="CPU offload strategy: none needs ~20 GB VRAM, sequential the least (and is slowest)",
     )
     ap.add_argument(
+        "--resident",
+        default=",".join(d.resident),
+        help=(
+            "Comma-separated pipeline components to pin to the GPU instead of offloading "
+            "them, e.g. 'transformer,vae'. Only meaningful with --offload model/sequential"
+        ),
+    )
+    ap.add_argument(
+        "--vae-tiling",
+        action="store_true",
+        default=d.vae_tiling,
+        help="Decode the VAE in tiles — much lower peak memory at high resolutions",
+    )
+    ap.add_argument(
+        "--vae-slicing",
+        action="store_true",
+        default=d.vae_slicing,
+        help="Decode one latent at a time — lowers peak memory when batching",
+    )
+    ap.add_argument(
+        "--attention-slicing",
+        action="store_true",
+        default=d.attention_slicing,
+        help="Compute attention in slices — lowers the per-step activation peak",
+    )
+    ap.add_argument(
         "--quant",
         choices=["none", *GGUF_QUANTS],
         default=d.quant,
@@ -703,6 +901,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="explicit .gguf path, or a file name inside --quant-repo; overrides --quant",
     )
     ap.add_argument("--max-images", type=int, default=10)
+    ap.add_argument(
+        "--pid-file",
+        default=None,
+        help="Write this process id here while running, so a second start can "
+        "detect an orphaned server that still holds the GPU",
+    )
     ap.add_argument("--max-pixels", type=int, default=2048 * 2048)
     ap.add_argument(
         "--idle-timeout",
@@ -711,6 +915,83 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="exit after this many seconds without a request (0 = never)",
     )
     return ap.parse_args(argv)
+
+
+def should_shut_down_for_idle(backend: Any, activity: Activity, idle_timeout: float) -> bool:
+    """True when the server has genuinely been idle long enough to exit.
+
+    A server that has not finished loading is **not** idle.  Loading the SDNQ
+    checkpoint takes 60-90s on a 7900 XTX, so an ``idle_timeout`` shorter than
+    that used to kill the process mid-load — it never served a single request,
+    and the client saw the connection refused.
+    """
+    if idle_timeout <= 0:
+        return False
+    try:
+        if backend.health().get("status") != "ready":
+            return False
+    except Exception:  # pragma: no cover - a backend that cannot self-report
+        return False
+    return activity.idle_for() > idle_timeout
+
+
+def force_exit_after(
+    grace: float,
+    exited: threading.Event,
+    pid_file: str | None = None,
+    exit_fn: Any = None,
+) -> threading.Thread:
+    """Hard-exit the process if a graceful shutdown has not finished in *grace*.
+
+    uvicorn waits for in-flight requests before returning from ``run()``.  A
+    render holds the pipeline lock for minutes and can wedge indefinitely, and
+    for all that time the process keeps its weights on the GPU while no longer
+    answering on its port — so a second server can be started on top of it.
+    Escalating to ``os._exit`` is what makes ``/shutdown`` mean it.
+
+    Returns the watchdog thread; it ends as soon as *exited* is set.
+    """
+    exit_fn = exit_fn or os._exit
+
+    def wait_then_kill() -> None:
+        if exited.wait(grace):
+            return
+        logger.warning(
+            "still running %.0fs after shutdown — forcing exit (pid %d)", grace, os.getpid()
+        )
+        _remove_pid_file(pid_file)
+        exit_fn(3)
+
+    t = threading.Thread(target=wait_then_kill, name="qwen-image-force-exit", daemon=True)
+    t.start()
+    return t
+
+
+def _write_pid_file(path: str | None, port: int) -> None:
+    """Record this process so a later ``start`` can see an orphan holding the GPU.
+
+    The listening socket is *not* enough: uvicorn closes it as soon as a
+    graceful shutdown begins, while the process — and its share of the card —
+    lives on until the in-flight render returns.
+    """
+    if not path:
+        return
+    try:
+        f = Path(path).expanduser()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"pid": os.getpid(), "port": port}), encoding="utf-8")
+    except OSError:  # pragma: no cover - a pidfile is best-effort
+        logger.warning("could not write pid file %s", path, exc_info=True)
+
+
+def _remove_pid_file(path: str | None) -> None:
+    """Delete the pidfile, tolerating a concurrent delete."""
+    if not path:
+        return
+    try:
+        Path(path).expanduser().unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - best-effort
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -743,6 +1024,10 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             dtype=args.dtype,
             offload=args.offload,
+            vae_tiling=args.vae_tiling,
+            vae_slicing=args.vae_slicing,
+            attention_slicing=args.attention_slicing,
+            resident=tuple(c.strip() for c in args.resident.split(",") if c.strip()),
             quant=args.quant,
             quant_repo=args.quant_repo,
             quant_file=args.quant_file,
@@ -750,10 +1035,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     activity = Activity()
     server: uvicorn.Server | None = None
+    exited = threading.Event()
 
     def stop() -> None:
-        if server is not None:
-            server.should_exit = True
+        if server is None:
+            return
+        server.should_exit = True
+        force_exit_after(SHUTDOWN_GRACE_S, exited, args.pid_file)
 
     app = create_app(
         backend,
@@ -767,14 +1055,28 @@ def main(argv: list[str] | None = None) -> int:
     def watchdog() -> None:
         while not server.should_exit:
             time.sleep(10)
-            if args.idle_timeout > 0 and activity.idle_for() > args.idle_timeout:
+            if should_shut_down_for_idle(backend, activity, args.idle_timeout):
                 logger.info("idle for %.0fs — shutting down", activity.idle_for())
                 stop()
 
-    threading.Thread(target=backend.load, name="qwen-image-load", daemon=True).start()
+    def load_then_mark_ready() -> None:
+        # The idle clock starts at process start, but loading 11-31 GiB is not
+        # idleness: without this the watchdog can shut the server down before it
+        # has served anything, and a short ``idle_timeout`` becomes unusable.
+        try:
+            backend.load()
+        finally:
+            activity.touch()
+
+    threading.Thread(target=load_then_mark_ready, name="qwen-image-load", daemon=True).start()
     threading.Thread(target=watchdog, name="qwen-image-idle", daemon=True).start()
     logger.info("listening on http://%s:%d (pid %d)", args.host, args.port, os.getpid())
-    server.run(sockets=[sock])
+    _write_pid_file(args.pid_file, args.port)
+    try:
+        server.run(sockets=[sock])
+    finally:
+        exited.set()
+        _remove_pid_file(args.pid_file)
     logger.info("server stopped (pid %d)", os.getpid())
     return 0
 

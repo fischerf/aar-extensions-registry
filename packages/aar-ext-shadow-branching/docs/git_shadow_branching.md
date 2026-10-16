@@ -157,6 +157,19 @@ shadow-auto: <tool> turn-<N>
 
 Only these commits count as logical checkpoints.
 
+A checkpoint commit MAY carry git trailers in its body that tie it to the user
+prompt during which it was taken; the subject line stays unchanged:
+
+```text
+Shadow-Prompt: <P>
+Shadow-Prompt-Text: <single-line excerpt of the prompt>
+```
+
+`P` numbers prompts that produced at least one checkpoint, starting at 1, and
+MUST NOT be reused for a different prompt within a session (not even after an
+undo). Hosts that record trailers SHOULD reconstruct them on resume and on
+preserved branches; hosts that do not MUST still accept such commits.
+
 ### 5.7 Meta commit
 
 A housekeeping commit that persists session context or clears pending changes
