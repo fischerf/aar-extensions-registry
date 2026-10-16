@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,8 +7,8 @@ name = "aar-ext-qwen-image"
 version = "0.2.0"
 description = "Local text-to-image and image editing tools backed by Qwen-Image-2.1"
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = ["aar-agent", "httpx>=0.28"]
+requires-python = ">=3.12.2"
+dependencies = ["aar-agent", "httpx>=0.28.1"]
 keywords = ["aar-extension", "image-generation", "diffusion", "qwen", "tool"]
 license = { text = "Apache-2.0" }
 

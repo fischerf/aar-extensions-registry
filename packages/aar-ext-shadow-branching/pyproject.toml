@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,8 +7,8 @@ name = "aar-ext-shadow-branching"
 version = "0.7.0"
 description = "Session-scoped git isolation with checkpoints, forks, and safe merge-back for Aar agent sessions."
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = ["aar"]
+requires-python = ">=3.12.2"
+dependencies = ["aar-agent"]
 keywords = ["aar-extension", "git", "safety", "slash-commands"]
 license = { text = "MIT" }
 

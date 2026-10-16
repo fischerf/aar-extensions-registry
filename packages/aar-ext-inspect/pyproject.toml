@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,9 +7,9 @@ name = "aar-ext-inspect"
 version = "0.1.0"
 description = "Slash-commands extension that adds a /inspect command to analyze the current session and print a human-readable report."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12.2"
 dependencies = [
-    "aar",
+    "aar-agent",
 ]
 keywords = ["aar-extension", "ui", "observability"]
 authors = [

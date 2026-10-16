@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,7 @@ name = "aar-ext-usage-tracker"
 version = "0.1.0"
 description = "Track per-provider API quota and usage via ~/.aar/usage.json"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12.2"
 dependencies = ["aar-agent"]
 keywords = ["aar-extension", "observability", "quota"]
 license = {text = "Apache-2.0"}
